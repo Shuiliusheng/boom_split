@@ -161,6 +161,14 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
                                                     // (can still be stopped in ren or dis)
   val dec_ready  = Wire(Bool())
   val dec_xcpts  = Wire(Vec(coreWidth, Bool()))
+
+  //chw: 增加信号，用于为额外的阶段记录信息
+  //新的阶段：microOps -> transbuffer
+  val tran_uops   = Wire(Vec(coreWidth, new MicroOp()))
+  val tran_valids = Wire(Vec(coreWidth, Bool()))
+  val tran_fire = Wire(Vec(coreWidth, Bool()))
+  val tran_xcpts  = Wire(Vec(coreWidth, Bool()))
+
   val ren_stalls = Wire(Vec(coreWidth, Bool()))
 
   // Rename2/Dispatch stage
@@ -575,6 +583,14 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     dec_uops(w).cycles := debug_cycles.value
   }
 
+  //chw: 更新一些复杂指令的译码信号
+  for (w <- 0 until coreWidth) {
+    //记录哪些有效的译码指令是复杂指令
+    dec_cInsts(w) := !decode_units(w).io.deq.is_decoded && dec_valids(w)
+    //failed包括了当前需要译码的复杂指令有哪些没有被译码
+    dec_cInsts_failed(w) := Mux(dec_cInsts(w), Mux((compDU_idx === w.U), false.B, true.B), false.B)
+  }
+
   //-------------------------------------------------------------
   // FTQ GetPC Port Arbitration
 
@@ -606,9 +622,12 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
 
 
   // Frontend Exception Requests
-  val xcpt_idx = PriorityEncoder(dec_xcpts)
-  xcpt_pc_req.valid    := dec_xcpts.reduce(_||_)
-  xcpt_pc_req.bits     := dec_uops(xcpt_idx).ftq_idx
+  //chw: 更改由于增加一个阶段，而导致的对异常信息的记录阶段的变化
+  val xcpt_idx_tran = PriorityEncoder(tran_xcpts)
+  val xcpt_idx_dec  = PriorityEncoder(dec_xcpts)
+  val xcpt_idx = Mux(isUnicoreMode, xcpt_idx_tran, xcpt_idx_dec)
+  xcpt_pc_req.valid    := Mux(isUnicoreMode, tran_xcpts.reduce(_||_), dec_xcpts.reduce(_||_))
+  xcpt_pc_req.bits     := Mux(isUnicoreMode, tran_uops(xcpt_idx).ftq_idx, dec_uops(xcpt_idx).ftq_idx)
   //rob.io.xcpt_fetch_pc := RegEnable(io.ifu.get_pc.fetch_pc, dis_ready)
   rob.io.xcpt_fetch_pc := io.ifu.get_pc(0).pc
 
@@ -627,18 +646,26 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   // stall fetch/dcode because we ran out of branch tags
   val branch_mask_full = Wire(Vec(coreWidth, Bool()))
 
-  val dec_hazards = (0 until coreWidth).map(w =>
-                      dec_valids(w) &&
-                      (  !dis_ready
-                      || rob.io.commit.rollback
-                      || dec_xcpt_stall
-                      || branch_mask_full(w)
-                      || brupdate.b1.mispredict_mask =/= 0.U
-                      || brupdate.b2.mispredict
-                      || io.ifu.redirect_flush))
+  //chw：根据处理器当前的状态不同，选择不同的处理方式
+  val dec_hazards = Wire(Vec(coreWidth, Bool()))
+  for(w <- 0 until coreWidth){
+    when(isUnicoreMode){
+      //在unicore模式下，tran_enq_ready无效时，则本周期出现了结构冒险，因为译码的微指令无法传递到下一阶段
+      dec_hazards(w) := dec_valids(w) && (!tran_enq_ready || all_hazard)
+    }
+    .otherwise{
+      dec_hazards(w) := dec_valids(w) && (!dis_ready || all_hazard || 
+                                          rob.io.commit.rollback || dec_xcpt_stall || branch_mask_full(w))
+    }
+  }
 
   val dec_stalls = dec_hazards.scanLeft(false.B) ((s,h) => s || h).takeRight(coreWidth)
-  dec_fire := (0 until coreWidth).map(w => dec_valids(w) && !dec_stalls(w))
+  // dec_fire := (0 until coreWidth).map(w => dec_valids(w) && !dec_stalls(w))
+  //chw: 更新dec_fire信号，因为引入了复杂指令的译码
+  //记录了从哪一条指令开始，由于复杂指令没有被译码，而导致之后的指令都无法进入下一个阶段
+  val dec_cInsts_failed_stall = dec_cInsts_failed.scanLeft(false.B) ((s,h) => s || h).takeRight(coreWidth)
+  //增加了对dec_cInsts_failed_stall的判断： 如果有译码单元遇到了复杂指令，并且compDU没有对该指令进行译码，则意味着遇到了结构冒险
+  dec_fire := (0 until coreWidth).map(w => dec_valids(w) && !dec_stalls(w) && !dec_cInsts_failed_stall(w))
 
   // all decoders are empty and ready for new instructions
   dec_ready := dec_fire.last
@@ -649,6 +676,145 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     dec_finished_mask := dec_fire.asUInt | dec_finished_mask
   }
 
+  //chw: debug printf
+  for (w <- 0 until coreWidth) {
+    when(isUnicoreMode){
+      printf("cycles: %d, decode info, w: %d, dec_valid: %d, fire: %d, stall: %d\n", debug_cycles.value, w.U, dec_valids(w), dec_fire(w), dec_stalls(w))
+    }
+  }
+
+  //chw：统计译码器的输出信号，将有效的微指令排列起来，计算当前周期有效的微指令数
+  val dec_uops_set = WireInit(VecInit(Seq.fill(enqTranBuff_entries){NullMicroOp}))
+  val dec_vals_set = WireInit(VecInit(Seq.fill(enqTranBuff_entries){false.B}))
+  val dec_uops_num = Wire(Vec(coreWidth, UInt(5.W)))
+  //takeRight取左边的coreWidth+1个元素
+  val uops_idxs = dec_uops_num.scanLeft(0.U) ((s,h) => s.asUInt + h.asUInt).takeRight(coreWidth+1)
+  val dec_uops_total_num = Wire(UInt(5.W))
+  dec_uops_total_num := uops_idxs(coreWidth)    //当前有效的指令数
+  
+  for(w <- 0 until coreWidth){
+    when(!dec_valids(w) || all_hazard){
+      //如果译码指令无效或者当前周期出现冒险，则译码单元得到的微指令数量为0
+      dec_uops_num(w) := 0.U
+    }
+    .elsewhen(dec_cInsts_failed_stall(w)){
+      //如果存在复杂指令，并且没有被compDU译码，则需要停滞该指令和该指令之后的所有指令
+      dec_uops_num(w) := 0.U
+    }
+    .elsewhen(dec_cInsts(w)){
+      //如果w是一条复杂指令，并且没有被停滞，则应取复杂译码的输出
+      dec_uops_num(w) := complex_decode_unit.io.deq.num
+    }
+    .otherwise{
+      //此时，意味着w是一条有效的简单指令
+      dec_uops_num(w) := decode_units(w).io.deq.num
+    }
+
+    //chw: debug printf
+    when(isUnicoreMode){
+      printf("cycles: %d, w: %d, decode inst: 0x%x, 0x%x, cInsts signal: %d, failed: %d, uops_num: %d, idx: %d, total:%d\n", debug_cycles.value, w.U, dec_fbundle.uops(w).bits.debug_pc, dec_fbundle.uops(w).bits.inst, dec_cInsts(w), dec_cInsts_failed(w), dec_uops_num(w), uops_idxs(w), dec_uops_total_num)
+    }
+  }
+  
+
+  //将当前周期译码得到的有效指令，按序排列到dec_uops_set中，最多32个
+  for(i <- 0 until enqTranBuff_entries){
+    dec_vals_set(i) := false.B
+  }
+  for(w <- 0 until coreWidth){
+    when(dec_fire(w)){
+      when(dec_cInsts(w)){  //如果译码成功，并且当前是一条复杂指令，则结果一定在compDU中
+        for (i <- 0 until 8){//8需要根据复杂译码器的输出数量进行更改
+          when(complex_decode_unit.io.deq.uop_valids(i)){
+            dec_uops_set(i) := complex_decode_unit.io.deq.uops(i)
+            dec_vals_set(i) := Mux(io.ifu.redirect_flush, false.B,complex_decode_unit.io.deq.uop_valids(i) && dec_fire(w) && isUnicoreMode)
+          }
+        }
+      }
+      .otherwise{
+        for (i <- 0 until 4){
+          when(decode_units(w).io.deq.uop_valids(i)) {
+            val idx = uops_idxs(w) + i.U
+            dec_uops_set(idx) := decode_units(w).io.deq.uops(i)
+            dec_vals_set(idx) := Mux(io.ifu.redirect_flush, false.B, decode_units(w).io.deq.uop_valids(i) && dec_fire(w) && isUnicoreMode)
+          }
+        }
+      }
+    }
+  }
+
+  //chw: debug printf
+  when(dec_uops_total_num =/= 0.U){
+    for(i <- 0 until 10){
+      when(isUnicoreMode){
+          printf("cycles: %d, dec_uops_set: w: %d, valid: %d, uop: 0x%x, 0x%x\n", debug_cycles.value, i.U, dec_vals_set(i), dec_uops_set(i).debug_pc, dec_uops_set(i).inst)
+      }
+    }
+  }
+
+  ////////////////////////////////////////////////////////////////////////////////////////
+  //chw:  增加的阶段： Enq Transform Buffer /////////////////////
+  //将最多enqTranBuff_entries条译码得到的有效微指令，拆分成n组，每一组tranBuff_enq_width条指令
+  val dec_uops_total = Wire(Vec(enqTranBuff_entries/tranBuff_enq_width, new DecodeUops(tranBuff_enq_width)))
+  for( w <- 0 until enqTranBuff_entries/tranBuff_enq_width){
+    for( i <- 0 until tranBuff_enq_width){
+      dec_uops_total(w).dec_uops(i) := dec_uops_set(w*tranBuff_enq_width+i)
+      dec_uops_total(w).val_mask(i) := dec_vals_set(w*tranBuff_enq_width+i)
+    }
+  }
+
+  val trans_enq_buffer  = Module(new EnqTranBuff)
+  trans_enq_buffer.io.clear := io.ifu.redirect_flush || !isUnicoreMode
+  trans_enq_buffer.io.enq := dec_uops_total
+  //set_num为组的数量，如果只有一组则为0，
+  trans_enq_buffer.io.set_num := (dec_uops_total_num.asUInt - 1.U) >> enqTranBuff_setidx_bits.U  //n*8个
+  trans_enq_buffer.io.enq_valid := dec_fire.reduce(_||_)
+  trans_enq_buffer.io.isUnicoreMode := isUnicoreMode
+
+  //trans_enq_buffer是否可以继续进入指令，即enq ready?
+  tran_enq_ready := trans_enq_buffer.io.enq_ready
+
+  //chw: debug printf
+  when(isUnicoreMode){
+    printf("cycles: %d, trans_enq_buffer info, set_num: %d, enq_valid: %d, clear: %d, enq_ready: %d\n", debug_cycles.value, trans_enq_buffer.io.set_num, trans_enq_buffer.io.enq_valid, trans_enq_buffer.io.clear, trans_enq_buffer.io.enq_ready)
+  }
+
+
+  //////////////inst popped out the buffer
+  val tran_finished_mask = RegInit(0.U(coreWidth.W))
+  for (w <- 0 until coreWidth) {
+    tran_uops(w) := trans_enq_buffer.io.deq.tran_uops(w)
+    tran_valids(w) := trans_enq_buffer.io.deq.tran_valids(w) && trans_enq_buffer.io.deq_valid && !tran_finished_mask(w)  && isUnicoreMode
+  }
+
+  tran_xcpts := tran_uops zip tran_valids map {case (u,v) => u.exception && v}
+  val tran_xcpt_stall = tran_xcpts.reduce(_||_) && !xcpt_pc_req.ready
+
+  val tran_hazard1 = !dis_ready || tran_xcpt_stall || rob.io.commit.rollback || all_hazard
+  val tran_hazards = (0 until coreWidth).map(w => 
+                      tran_valids(w) && (branch_mask_full(w) || tran_hazard1))
+
+  val tran_stalls = tran_hazards.scanLeft(false.B) ((s,h) => s || h).takeRight(coreWidth)
+
+  tran_fire := (0 until coreWidth).map(w => tran_valids(w) && !tran_stalls(w))
+  
+  trans_enq_buffer.io.deq_ready := tran_fire.last
+  
+  //chw: for new tranform
+  when (trans_enq_buffer.io.deq_ready || io.ifu.redirect_flush) {
+    tran_finished_mask := 0.U
+  } .otherwise {
+    tran_finished_mask := tran_fire.asUInt | tran_finished_mask
+  }
+
+  //chw: debug printf
+  when(isUnicoreMode){
+    for (w <- 0 until coreWidth) {
+      printf("cycles: %d, tran output info, w: %d, valid: %d, tran_fire: %d, pc: 0x%x, inst: 0x%x\n", debug_cycles.value, w.U, tran_valids(w), tran_fire(w), tran_uops(w).debug_pc, tran_uops(w).inst)
+    }
+  }
+
+
   //-------------------------------------------------------------
   // Branch Mask Logic
 
@@ -656,14 +822,22 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   dec_brmask_logic.io.flush_pipeline := RegNext(rob.io.flush.valid)
 
   for (w <- 0 until coreWidth) {
-    dec_brmask_logic.io.is_branch(w) := !dec_finished_mask(w) && dec_uops(w).allocate_brtag
-    dec_brmask_logic.io.will_fire(w) :=  dec_fire(w) &&
-                                         dec_uops(w).allocate_brtag // ren, dis can back pressure us
-    dec_uops(w).br_tag  := dec_brmask_logic.io.br_tag(w)
-    dec_uops(w).br_mask := dec_brmask_logic.io.br_mask(w)
+    when(isUnicoreMode){
+      //chw: 更改原本生成br_mask的逻辑，即原本在decode末尾，现在变为transbuffer的末尾
+      dec_brmask_logic.io.is_branch(w) := !tran_finished_mask(w) && tran_uops(w).allocate_brtag
+      dec_brmask_logic.io.will_fire(w) :=  tran_fire(w) && tran_uops(w).allocate_brtag 
+      tran_uops(w).br_tag  := dec_brmask_logic.io.br_tag(w)
+      tran_uops(w).br_mask := dec_brmask_logic.io.br_mask(w)
+    }
+    .otherwise{
+      dec_brmask_logic.io.is_branch(w) := !dec_finished_mask(w) && dec_uops(w).allocate_brtag
+      dec_brmask_logic.io.will_fire(w) :=  dec_fire(w) && dec_uops(w).allocate_brtag 
+      dec_uops(w).br_tag  := dec_brmask_logic.io.br_tag(w)
+      dec_uops(w).br_mask := dec_brmask_logic.io.br_mask(w)
+    }
   }
-
   branch_mask_full := dec_brmask_logic.io.is_full
+
 
   //-------------------------------------------------------------
   //-------------------------------------------------------------
@@ -678,8 +852,15 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
 
     rename.io.debug_rob_empty := rob.io.empty
 
-    rename.io.dec_fire := dec_fire
-    rename.io.dec_uops := dec_uops
+    //chw: 更改重命名阶段的输入
+    when(isUnicoreMode){
+      rename.io.dec_fire := tran_fire
+      rename.io.dec_uops := tran_uops
+    }
+    .otherwise{
+      rename.io.dec_fire := dec_fire
+      rename.io.dec_uops := dec_uops
+    }
 
     rename.io.dis_fire := dis_fire
     rename.io.dis_ready := dis_ready
