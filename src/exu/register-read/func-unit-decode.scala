@@ -142,11 +142,11 @@ object MulDivRRdDecode extends RRdDecodeConstants
                                // |      |  |  use mem pipe        |         |         |     rf wen |
                                // |      |  |  |  alu fcn  wd/word?|         |         |     |      |
                                // |      |  |  |  |        |       |         |         |     |      |
-         BitPat(uopMUL)   -> List(BR_N , N, Y, N, FN_MUL,   DW_XPR,OP1_RS1 , OP2_RS2 , IS_X,  REN_1,CSR.N),
-         BitPat(uopMULH)  -> List(BR_N , N, Y, N, FN_MULH,  DW_XPR,OP1_RS1 , OP2_RS2 , IS_X,  REN_1,CSR.N),
-         BitPat(uopMULHU) -> List(BR_N , N, Y, N, FN_MULHU, DW_XPR,OP1_RS1 , OP2_RS2 , IS_X,  REN_1,CSR.N),
-         BitPat(uopMULHSU)-> List(BR_N , N, Y, N, FN_MULHSU,DW_XPR,OP1_RS1 , OP2_RS2 , IS_X,  REN_1,CSR.N),
-         BitPat(uopMULW)  -> List(BR_N , N, Y, N, FN_MUL,   DW_32 ,OP1_RS1 , OP2_RS2 , IS_X,  REN_1,CSR.N),
+         BitPat(uopMUL)   -> List(BR_N , N, Y, N, FN_MUL,   DW_XPR,OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
+         BitPat(uopMULH)  -> List(BR_N , N, Y, N, FN_MULH,  DW_XPR,OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
+         BitPat(uopMULHU) -> List(BR_N , N, Y, N, FN_MULHU, DW_XPR,OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
+         BitPat(uopMULHSU)-> List(BR_N , N, Y, N, FN_MULHSU,DW_XPR,OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
+         BitPat(uopMULW)  -> List(BR_N , N, Y, N, FN_MUL,   DW_32 ,OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
 
          BitPat(uopDIV)   -> List(BR_N , N, Y, N, FN_DIV , DW_XPR, OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
          BitPat(uopDIVU)  -> List(BR_N , N, Y, N, FN_DIVU, DW_XPR, OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
@@ -299,6 +299,64 @@ object FDivRRdDecode extends RRdDecodeConstants
          BitPat(uopFSQRT_D) ->List(BR_N, N, Y, N, FN_X   , DW_X  , OP1_X   , OP2_X   , IS_X, REN_1, CSR.N))
 }
 
+
+//////////////////////////////////////////////Unicore RRdDecode table////////////////////////////////////////
+//chw: 在读寄存器阶段对uopCode进行再译码，以获取执行时的一些控制信号, decode table and signal
+class RRdCtrlSigs_Unicore(implicit p: Parameters) extends BoomBundle
+{
+  val br_type          = UInt(BR_N.getWidth.W)
+  val use_alupipe      = Bool()   //use alu pipe
+  val use_muldivpipe   = Bool()   //use muldiv pipe
+  val use_mempipe      = Bool()   //use mem pipe
+  val op_fcn      = Bits(SZ_ALU_FN.W)
+  val fcn_dw      = Bool()        //wd/word?
+  val op1_sel     = UInt(OP1_X.getWidth.W)
+  val op2_sel     = UInt(OP2_X.getWidth.W)
+  val imm_sel     = UInt(IS_X.getWidth.W)
+  val rf_wen      = Bool()      //register write enable
+  val csr_cmd     = Bits(CSR.SZ.W)
+
+  def decode(uopc: UInt, table: Iterable[(BitPat, List[BitPat])]) = {
+    val decoder = freechips.rocketchip.rocket.DecodeLogic(uopc, AluRRdDecode.default, table)
+    val sigs = Seq(br_type, use_alupipe, use_muldivpipe, use_mempipe, op_fcn,
+                   fcn_dw, op1_sel, op2_sel, imm_sel, rf_wen, csr_cmd)
+    sigs zip decoder map {case(s,d) => s := d}
+    this
+  }
+}
+
+/**
+ * Default register read constants
+ */
+abstract trait RRdDecodeConstants_Unicore
+{
+  val default: List[BitPat] =
+               List[BitPat](BR_N , Y, N, N, FN_ADD , DW_X  , OP1_X   , OP2_X   , IS_X, REN_0, CSR.N)
+  val table: Array[(BitPat, List[BitPat])]
+}
+
+/**
+ * ALU register read constants
+ */
+object AluRRdDecode_Unicore extends RRdDecodeConstants_Unicore
+{
+  val table: Array[(BitPat, List[BitPat])] =
+             Array[(BitPat, List[BitPat])](
+                              // br type
+                               // |      use alu pipe              op1 sel   op2 sel
+                               // |      |  use muldiv pipe        |         |         immsel       csr_cmd
+                               // |      |  |  use mem pipe        |         |         |     rf wen |
+                               // |      |  |  |  alu fcn  wd/word?|         |         |     |      |
+                               // |      |  |  |  |        |       |         |         |     |      |
+         BitPat(uopADDI)  -> List(BR_N , Y, N, N, FN_ADD , DW_32,  OP1_RS1 , OP2_IMM , IS_I, REN_1, CSR.N),
+         BitPat(uopADD)   -> List(BR_N , Y, N, N, FN_ADD , DW_32,  OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
+         BitPat(uopMUL)   -> List(BR_N , N, Y, N, FN_MUL , DW_XPR, OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
+         BitPat(uopMULH)  -> List(BR_N , N, Y, N, FN_MUL , DW_XPR, OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N))
+}
+
+
+
+
 /**
  * Register read decoder
  *
@@ -327,9 +385,36 @@ class RegisterReadDecode(supportedUnits: SupportedFuncUnits)(implicit p: Paramet
   if (supportedUnits.fpu) dec_table ++= FpuRRdDecode.table
   if (supportedUnits.fdiv) dec_table ++= FDivRRdDecode.table
   if (supportedUnits.ifpu) dec_table ++= IfmvRRdDecode.table
-  val rrd_cs = Wire(new RRdCtrlSigs()).decode(io.rrd_uop.uopc, dec_table)
+  val rrd_cs_riscv = Wire(new RRdCtrlSigs()).decode(io.rrd_uop.uopc, dec_table)
+
+  //chw: uopCode译码, 增加unicore的dec_table
+  var dec_table_unicore = AluRRdDecode_Unicore.table
+  val rrd_cs_unicore = Wire(new RRdCtrlSigs_Unicore()).decode(io.rrd_uop.uopc, dec_table_unicore)
+
+  io.rrd_uop.ctrl.br_type := Mux(io.rrd_uop.is_unicore, rrd_cs_unicore.br_type, rrd_cs_riscv.br_type)
+  io.rrd_uop.ctrl.op1_sel := Mux(io.rrd_uop.is_unicore, rrd_cs_unicore.op1_sel, rrd_cs_riscv.op1_sel)
+  io.rrd_uop.ctrl.op2_sel := Mux(io.rrd_uop.is_unicore, rrd_cs_unicore.op2_sel, rrd_cs_riscv.op2_sel)
+  io.rrd_uop.ctrl.imm_sel := Mux(io.rrd_uop.is_unicore, rrd_cs_unicore.imm_sel, rrd_cs_riscv.imm_sel)
+  io.rrd_uop.ctrl.op_fcn  := Mux(io.rrd_uop.is_unicore, rrd_cs_unicore.op_fcn.asUInt, rrd_cs_riscv.op_fcn.asUInt)
+  io.rrd_uop.ctrl.fcn_dw  := Mux(io.rrd_uop.is_unicore, rrd_cs_unicore.fcn_dw.asBool, rrd_cs_riscv.fcn_dw.asBool)
+  io.rrd_uop.ctrl.op3_sel := Mux(io.rrd_uop.is_unicore, io.rrd_uop.lrs3_rtype, OP3_NO)  //new
+
+  //M_XLR不确定是什么存储操作
+  when ( !io.rrd_uop.is_unicore && (io.rrd_uop.uopc === uopAMO_AG || (io.rrd_uop.uopc === uopLD && io.rrd_uop.mem_cmd === M_XLR))) {
+    io.rrd_uop.imm_packed := 0.U
+  }
+
+  //没有变化
+  io.rrd_uop.ctrl.is_load := io.rrd_uop.uopc === uopLD
+  io.rrd_uop.ctrl.is_sta  := io.rrd_uop.uopc === uopSTA || io.rrd_uop.uopc === uopAMO_AG
+  io.rrd_uop.ctrl.is_std  := io.rrd_uop.uopc === uopSTD || (io.rrd_uop.ctrl.is_sta && io.rrd_uop.lrs2_rtype === RT_FIX)
+
+  val raddr1 = io.rrd_uop.prs1 // although renamed, it'll stay 0 if lrs1 = 0
+  val csr_ren = (rrd_cs_riscv.csr_cmd === CSR.S || rrd_cs_riscv.csr_cmd === CSR.C) && raddr1 === 0.U
+  io.rrd_uop.ctrl.csr_cmd := Mux(csr_ren && !io.rrd_uop.is_unicore, CSR.R, Mux(io.rrd_uop.is_unicore, rrd_cs_unicore.csr_cmd, rrd_cs_riscv.csr_cmd))
 
   // rrd_use_alupipe is unused
+  /*
   io.rrd_uop.ctrl.br_type := rrd_cs.br_type
   io.rrd_uop.ctrl.op1_sel := rrd_cs.op1_sel
   io.rrd_uop.ctrl.op2_sel := rrd_cs.op2_sel
@@ -346,9 +431,9 @@ class RegisterReadDecode(supportedUnits: SupportedFuncUnits)(implicit p: Paramet
 
   val raddr1 = io.rrd_uop.prs1 // although renamed, it'll stay 0 if lrs1 = 0
   val csr_ren = (rrd_cs.csr_cmd === CSR.S || rrd_cs.csr_cmd === CSR.C) && raddr1 === 0.U
-  io.rrd_uop.ctrl.csr_cmd := Mux(csr_ren, CSR.R, rrd_cs.csr_cmd)
+  io.rrd_uop.ctrl.csr_cmd := Mux(csr_ren, CSR.R, rrd_cs.csr_cmd)*/
 
-  require (rrd_cs.op_fcn.getWidth == FN_SRA.getWidth)
+  require ( (rrd_cs_riscv.op_fcn.getWidth == FN_SRA.getWidth) && (rrd_cs_unicore.op_fcn.getWidth == FN_SRA.getWidth))
 
   //-------------------------------------------------------------
   // set outputs
