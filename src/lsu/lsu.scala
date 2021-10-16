@@ -132,6 +132,10 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   // Speculatively safe load (barring memory ordering failure)
   val clr_unsafe      = Output(Vec(memWidth, Valid(UInt(robAddrSz.W))))
 
+   //chw: 在LSU的IO接口中增加输出完成的存储指令的self_idx和首指令rob_idx
+  val clr_bsy_first_idx        = Output(Vec(memWidth + 1, UInt(robAddrSz.W)))
+  val clr_bsy_self_idx         = Output(Vec(memWidth + 1, UInt(microIdxSz.W)))
+
   // Tell the DCache to clear prefetches/speculating misses
   val fence_dmem   = Input(Bool())
 
@@ -931,6 +935,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val clr_bsy_rob_idx = Reg(Vec(memWidth, UInt(robAddrSz.W)))
   val clr_bsy_brmask  = Reg(Vec(memWidth, UInt(maxBrCount.W)))
 
+  //chw: 在LSU中记录完成的存储指令的信息
+  val clr_bsy_first_idx = Reg(Vec(memWidth, UInt(robAddrSz.W)))
+  val clr_bsy_self_idx  = Reg(Vec(memWidth, UInt(microIdxSz.W)))
+
   for (w <- 0 until memWidth) {
     clr_bsy_valid   (w) := false.B
     clr_bsy_rob_idx (w) := 0.U
@@ -944,6 +952,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                             !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
       clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+
+      //chw: 更新clr_bsy_first_idx和self_index
+      clr_bsy_first_idx(w) := mem_stq_incoming_e(w).bits.uop.rob_inst_idx
+      clr_bsy_self_idx(w)  := mem_stq_incoming_e(w).bits.uop.self_index
+
     } .elsewhen (fired_sta_incoming(w)) {
       clr_bsy_valid   (w) := mem_stq_incoming_e(w).valid            &&
                              mem_stq_incoming_e(w).bits.data.valid  &&
@@ -952,6 +965,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                             !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
       clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+
+      //chw: 更新clr_bsy_first_idx和self_index
+      clr_bsy_first_idx(w) := mem_stq_incoming_e(w).bits.uop.rob_inst_idx
+      clr_bsy_self_idx(w)  := mem_stq_incoming_e(w).bits.uop.self_index
     } .elsewhen (fired_std_incoming(w)) {
       clr_bsy_valid   (w) := mem_stq_incoming_e(w).valid                 &&
                              mem_stq_incoming_e(w).bits.addr.valid       &&
@@ -960,10 +977,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                             !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
       clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+
+      //chw: 更新clr_bsy_first_idx和self_index
+      clr_bsy_first_idx(w) := mem_stq_incoming_e(w).bits.uop.rob_inst_idx
+      clr_bsy_self_idx(w)  := mem_stq_incoming_e(w).bits.uop.self_index
     } .elsewhen (fired_sfence(w)) {
       clr_bsy_valid   (w) := (w == 0).B // SFence proceeds down all paths, only allow one to clr the rob
       clr_bsy_rob_idx (w) := mem_incoming_uop(w).rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_incoming_uop(w))
+
+      //chw: 更新clr_bsy_first_idx和self_index
+      clr_bsy_first_idx(w) := mem_incoming_uop(w).rob_inst_idx
+      clr_bsy_self_idx(w)  := mem_incoming_uop(w).self_index
+
     } .elsewhen (fired_sta_retry(w)) {
       clr_bsy_valid   (w) := mem_stq_retry_e.valid            &&
                              mem_stq_retry_e.bits.data.valid  &&
@@ -972,12 +998,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                             !IsKilledByBranch(io.core.brupdate, mem_stq_retry_e.bits.uop)
       clr_bsy_rob_idx (w) := mem_stq_retry_e.bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_retry_e.bits.uop)
+
+      //chw: 更新clr_bsy_first_idx和self_index
+      clr_bsy_first_idx(w) := mem_stq_retry_e.bits.uop.rob_inst_idx
+      clr_bsy_self_idx(w)  := mem_stq_retry_e.bits.uop.self_index
     }
 
     io.core.clr_bsy(w).valid := clr_bsy_valid(w) &&
                                !IsKilledByBranch(io.core.brupdate, clr_bsy_brmask(w)) &&
                                !io.core.exception && !RegNext(io.core.exception) && !RegNext(RegNext(io.core.exception))
     io.core.clr_bsy(w).bits  := clr_bsy_rob_idx(w)
+
+    //chw: 更新LSU的输出接口信号clr_bsy_first_idx和clr_bsy_self_idx
+    io.core.clr_bsy_first_idx(w)  := clr_bsy_first_idx(w)
+    io.core.clr_bsy_self_idx(w)   := clr_bsy_self_idx(w)
   }
 
   val stdf_clr_bsy_valid   = RegInit(false.B)
@@ -1003,6 +1037,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                     !IsKilledByBranch(io.core.brupdate, stdf_clr_bsy_brmask) &&
                                     !io.core.exception && !RegNext(io.core.exception) && !RegNext(RegNext(io.core.exception))
   io.core.clr_bsy(memWidth).bits  := stdf_clr_bsy_rob_idx
+
+  //chw: 更新LSU的输出接口信号clr_bsy_first_idx和clr_bsy_self_idx
+  io.core.clr_bsy_first_idx(memWidth)  := mem_stdf_uop.rob_inst_idx
+  io.core.clr_bsy_self_idx(memWidth)   := mem_stdf_uop.self_index
 
 
 
