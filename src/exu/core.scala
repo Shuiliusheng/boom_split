@@ -1270,8 +1270,15 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     (issport, wakeup) <- iu.io.wakeup_ports zip int_iss_wakeups
   }{
     issport.valid := wakeup.valid
-    issport.bits.pdst := wakeup.bits.uop.pdst
     issport.bits.poisoned := wakeup.bits.uop.iw_p1_poisoned || wakeup.bits.uop.iw_p2_poisoned
+
+    //chw: 更新IQ中关于flag寄存器的唤醒信号
+    issport.bits.pdst := wakeup.bits.uop.pdst
+
+    //chw: update int issue unit wakeup port infor: pwflag & flag_valid
+    issport.bits.pwflag := wakeup.bits.uop.pwflag
+    //位数不对等的情况下，会补零进行赋值和比较，所以是对的
+    issport.bits.flag_valid := wakeup.bits.uop.wflag && wakeup.bits.uop.is_unicore
 
     require (iu.io.wakeup_ports.length == int_iss_wakeups.length)
   }

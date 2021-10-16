@@ -89,6 +89,9 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   val p3    = RegInit(false.B)
   val ppred = RegInit(false.B)
 
+  //chw : issueslot中增加flag寄存器是否就绪的判断
+  val flag_ready = RegInit(false.B)
+
   // Poison if woken up by speculative load.
   // Poison lasts 1 cycle (as ldMiss will come on the next cycle).
   // SO if poisoned is true, set it to false!
@@ -164,12 +167,17 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   val next_p2 = WireInit(p2)
   val next_p3 = WireInit(p3)
   val next_ppred = WireInit(ppred)
+  //chw：issueslot 似乎没有用到
+  val next_flag_ready = WireInit(flag_ready)
 
   when (io.in_uop.valid) {
     p1 := !(io.in_uop.bits.prs1_busy)
     p2 := !(io.in_uop.bits.prs2_busy)
     p3 := !(io.in_uop.bits.prs3_busy)
     ppred := !(io.in_uop.bits.ppred_busy)
+
+    //chw：issueslot, 将要进入的指令有效时，更新标志寄存器的就绪信号（unicore&&rflag）
+    flag_ready := Mux(io.in_uop.bits.is_unicore && io.in_uop.bits.rflag, !(io.in_uop.bits.pflag_busy), true.B)
   }
 
   when (io.ldspec_miss && next_p1_poisoned) {
@@ -193,6 +201,13 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
     when (io.wakeup_ports(i).valid &&
          (io.wakeup_ports(i).bits.pdst === next_uop.prs3)) {
       p3 := true.B
+    }
+
+    //chw：issueslot wakeup, 根据wakeup端口的信息，更新flag_ready
+    when(io.wakeup_ports(i).valid && 
+        io.wakeup_ports(i).bits.flag_valid && next_uop.rflag &&
+        (io.wakeup_ports(i).bits.pwflag === next_uop.prflag)){
+      flag_ready := true.B
     }
   }
   when (io.pred_wakeup_port.valid && io.pred_wakeup_port.bits === next_uop.ppred) {
@@ -238,7 +253,9 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
 
   //-------------------------------------------------------------
   // Request Logic
-  io.request := is_valid && p1 && p2 && p3 && ppred && !io.kill
+  // io.request := is_valid && p1 && p2 && p3 && ppred && !io.kill
+  //chw: issueslot, 在判断发射槽是否就绪的逻辑中增加对flag_ready的判断
+  io.request := is_valid && p1 && p2 && p3 && ppred && !io.kill && flag_ready
   val high_priority = slot_uop.is_br || slot_uop.is_jal || slot_uop.is_jalr
   io.request_hp := io.request && high_priority
 
@@ -274,17 +291,22 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   io.out_uop.iw_p1_poisoned := p1_poisoned
   io.out_uop.iw_p2_poisoned := p2_poisoned
 
+  //chw：issueslot, 发射槽输出信号中重新更新pflag_busy信号
+  io.out_uop.pflag_busy := !flag_ready
+
+  //store指令的表项状态更新
   when (state === s_valid_2) {
-    when (p1 && p2 && ppred) {
+    when (p1 && p2 && ppred && flag_ready) {
       ; // send out the entire instruction as one uop
-    } .elsewhen (p1 && ppred) {
+    } .elsewhen (p1 && ppred && flag_ready) {
       io.uop.uopc := slot_uop.uopc
       io.uop.lrs2_rtype := RT_X
-    } .elsewhen (p2 && ppred) {
+    } .elsewhen (p2 && ppred && flag_ready) {
       io.uop.uopc := uopSTD
       io.uop.lrs1_rtype := RT_X
     }
   }
+
 
   // debug outputs
   io.debug.p1 := p1

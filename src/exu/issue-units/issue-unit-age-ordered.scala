@@ -100,6 +100,10 @@ class IssueUnitCollapsing(
     io.iss_uops(w).prs3 := 0.U
     io.iss_uops(w).lrs1_rtype := RT_X
     io.iss_uops(w).lrs2_rtype := RT_X
+
+    //chw: 初始化issueslot中表项的flag寄存器的信息
+    io.iss_uops(w).prflag := 0.U
+    io.iss_uops(w).rflag := false.B
   }
 
   val requests = issue_slots.map(s => s.request)

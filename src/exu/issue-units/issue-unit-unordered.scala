@@ -95,6 +95,10 @@ class IssueUnitStatic(
     io.iss_uops(w).prs3 := 0.U
     io.iss_uops(w).lrs1_rtype := RT_X
     io.iss_uops(w).lrs2_rtype := RT_X
+
+    //chw: 初始化issueslot中表项的flag寄存器的信息
+    io.iss_uops(w).prflag := 0.U
+    io.iss_uops(w).rflag := false.B
   }
 
   // TODO can we use flatten to get an array of bools on issue_slot(*).request?

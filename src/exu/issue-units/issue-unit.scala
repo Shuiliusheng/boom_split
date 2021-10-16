@@ -56,6 +56,10 @@ class IqWakeup(val pregSz: Int) extends Bundle
 {
   val pdst = UInt(width=pregSz.W)
   val poisoned = Bool()
+
+  //chw: 修改IQ的wakeup信号中的内容，即包括flag标志寄存器的唤醒信息
+  val pwflag = UInt(width=pregSz.W)
+  val flag_valid = Bool()
 }
 
 /**
