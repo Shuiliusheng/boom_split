@@ -41,7 +41,8 @@ class RegisterRead(
                         // numTotalReadPorts)
   numTotalBypassPorts: Int,
   numTotalPredBypassPorts: Int,
-  registerWidth: Int
+  registerWidth: Int,
+  numFlagRFReadPorts: Int
 )(implicit p: Parameters) extends BoomModule
 {
   val io = IO(new Bundle {
@@ -52,6 +53,8 @@ class RegisterRead(
     // interface with register file's read ports
     val rf_read_ports = Flipped(Vec(numTotalReadPorts, new RegisterFileReadPortIO(maxPregSz, registerWidth)))
     val prf_read_ports = Flipped(Vec(issueWidth, new RegisterFileReadPortIO(log2Ceil(ftqSz), 1)))
+    //chw: 在寄存器读阶段增加读取标志寄存器的IO信号
+    val flag_rf_read_ports = Flipped(Vec(numFlagRFReadPorts, new RegisterFileReadPortIO(maxPregSz, 4)))
 
     val bypass = Input(Vec(numTotalBypassPorts, Valid(new ExeUnitResp(registerWidth))))
     val pred_bypass = Input(Vec(numTotalPredBypassPorts, Valid(new ExeUnitResp(1))))
@@ -72,6 +75,9 @@ class RegisterRead(
   val exe_reg_rs2_data = Reg(Vec(issueWidth, Bits(registerWidth.W)))
   val exe_reg_rs3_data = Reg(Vec(issueWidth, Bits(registerWidth.W)))
   val exe_reg_pred_data = Reg(Vec(issueWidth, Bool()))
+
+  //chw: 在寄存器读阶段，增加寄存器，用于暂存读取的标志寄存器数据
+  val exe_reg_flag_data = Reg(Vec(issueWidth, Bits(4.W)))
 
   //-------------------------------------------------------------
   // hook up inputs
@@ -95,6 +101,9 @@ class RegisterRead(
   val rrd_rs2_data   = Wire(Vec(issueWidth, Bits(registerWidth.W)))
   val rrd_rs3_data   = Wire(Vec(issueWidth, Bits(registerWidth.W)))
   val rrd_pred_data  = Wire(Vec(issueWidth, Bool()))
+  //chw: 中间存储flag寄存器的结果
+  val rrd_flag_data = Wire(Vec(issueWidth, Bits(4.W)))
+
   rrd_rs1_data := DontCare
   rrd_rs2_data := DontCare
   rrd_rs3_data := DontCare
@@ -121,11 +130,17 @@ class RegisterRead(
 
     if (enableSFBOpt) io.prf_read_ports(w).addr := pred_addr
 
-    if (numReadPorts > 0) rrd_rs1_data(w) := Mux(RegNext(rs1_addr === 0.U), 0.U, io.rf_read_ports(idx+0).data)
-    if (numReadPorts > 1) rrd_rs2_data(w) := Mux(RegNext(rs2_addr === 0.U), 0.U, io.rf_read_ports(idx+1).data)
-    if (numReadPorts > 2) rrd_rs3_data(w) := Mux(RegNext(rs3_addr === 0.U), 0.U, io.rf_read_ports(idx+2).data)
+    //chw: unicore可以使用0号寄存器
+    if (numReadPorts > 0) rrd_rs1_data(w) := Mux(RegNext(rs1_addr === 0.U && (!io.iss_uops(w).is_unicore)), 0.U, io.rf_read_ports(idx+0).data)
+    if (numReadPorts > 1) rrd_rs2_data(w) := Mux(RegNext(rs2_addr === 0.U && (!io.iss_uops(w).is_unicore)), 0.U, io.rf_read_ports(idx+1).data)
+    if (numReadPorts > 2) rrd_rs3_data(w) := Mux(RegNext(rs3_addr === 0.U && (!io.iss_uops(w).is_unicore)), 0.U, io.rf_read_ports(idx+2).data)
 
     if (enableSFBOpt) rrd_pred_data(w) := Mux(RegNext(io.iss_uops(w).is_sfb_shadow), io.prf_read_ports(w).data, false.B)
+
+    //chw: 读取标志寄存器堆的数据
+    //issueWidth = numFlagRFReadPorts
+    io.flag_rf_read_ports(w).addr := io.iss_uops(w).prflag
+    rrd_flag_data(w) := Mux(RegNext(io.iss_uops(w).rflag && io.iss_uops(w).is_unicore), io.flag_rf_read_ports(w).data, 0.U(4.W))
 
     val rrd_kill = io.kill || IsKilledByBranch(io.brupdate, rrd_uops(w))
 
@@ -152,6 +167,11 @@ class RegisterRead(
   val bypassed_rs1_data = Wire(Vec(issueWidth, Bits(registerWidth.W)))
   val bypassed_rs2_data = Wire(Vec(issueWidth, Bits(registerWidth.W)))
   val bypassed_pred_data = Wire(Vec(issueWidth, Bool()))
+
+  //chw: 寄存器读阶段, 在unicore模式下，rs3同样可以被bypass
+  val bypassed_rs3_data = Wire(Vec(issueWidth, Bits(registerWidth.W)))
+  val bypassed_flag_data = Wire(Vec(issueWidth, Bits(4.W)))
+
   bypassed_pred_data := DontCare
 
   for (w <- 0 until issueWidth) {
@@ -166,6 +186,13 @@ class RegisterRead(
     val lrs2_rtype = rrd_uops(w).lrs2_rtype
     val ppred      = rrd_uops(w).ppred
 
+    //chw: 寄存器读阶段, bypass的处理，包括rs3和flag
+    var rs3_cases   = Array((false.B, 0.U(registerWidth.W)))
+    var flag_cases  = Array((false.B, 0.U(4.W)))
+    val prs3        = rrd_uops(w).prs3
+    val lrs3_rtype  = rrd_uops(w).lrs3_rtype
+    val prflag      = rrd_uops(w).prflag
+
     for (b <- 0 until numTotalBypassPorts)
     {
       val bypass = io.bypass(b)
@@ -174,6 +201,15 @@ class RegisterRead(
         && bypass.bits.uop.dst_rtype === RT_FIX && lrs1_rtype === RT_FIX && (prs1 =/= 0.U), bypass.bits.data))
       rs2_cases ++= Array((bypass.valid && (prs2 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
         && bypass.bits.uop.dst_rtype === RT_FIX && lrs2_rtype === RT_FIX && (prs2 =/= 0.U), bypass.bits.data))
+
+      //chw: 寄存器读阶段, 执行结果bypass到读寄存器阶段
+      //将执行阶段的结果，bypass到读寄存器阶段，节省一个周期的写寄存器
+      rs3_cases ++= Array((bypass.valid && (prs3 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
+        && bypass.bits.uop.dst_rtype === RT_FIX && lrs3_rtype === RT_FIX && (prs3 =/= 0.U), bypass.bits.data))
+      
+      val flag_case_valid = bypass.valid && (prflag === bypass.bits.uop.pwflag) && bypass.bits.uop.wflag && rrd_uops(w).rflag && bypass.bits.uop.is_unicore && rrd_uops(w).is_unicore
+
+      flag_cases ++= Array((flag_case_valid,  bypass.bits.flagdata)) //ExeUnitResp: flagdata
     }
 
     for (b <- 0 until numTotalPredBypassPorts)
@@ -185,6 +221,10 @@ class RegisterRead(
     if (numReadPorts > 0) bypassed_rs1_data(w)  := MuxCase(rrd_rs1_data(w), rs1_cases)
     if (numReadPorts > 1) bypassed_rs2_data(w)  := MuxCase(rrd_rs2_data(w), rs2_cases)
     if (enableSFBOpt)     bypassed_pred_data(w) := MuxCase(rrd_pred_data(w), pred_cases)
+
+    //for src3 & flag
+    if (numReadPorts > 2) bypassed_rs3_data(w)  := MuxCase(rrd_rs3_data(w), rs3_cases) 
+    bypassed_flag_data(w) := MuxCase(rrd_flag_data(w), flag_cases)   //chw
   }
 
   //-------------------------------------------------------------
@@ -197,8 +237,10 @@ class RegisterRead(
     val numReadPorts = numReadPortsArray(w)
     if (numReadPorts > 0) exe_reg_rs1_data(w) := bypassed_rs1_data(w)
     if (numReadPorts > 1) exe_reg_rs2_data(w) := bypassed_rs2_data(w)
-    if (numReadPorts > 2) exe_reg_rs3_data(w) := rrd_rs3_data(w)
+    // if (numReadPorts > 2) exe_reg_rs3_data(w) := rrd_rs3_data(w)
+    if (numReadPorts > 2) exe_reg_rs3_data(w) := bypassed_rs3_data(w)
     if (enableSFBOpt)     exe_reg_pred_data(w) := bypassed_pred_data(w)
+    exe_reg_flag_data(w) := bypassed_flag_data(w)
     // ASSUMPTION: rs3 is FPU which is NOT bypassed
   }
   // TODO add assert to detect bypass conflicts on non-bypassable things
@@ -215,5 +257,7 @@ class RegisterRead(
     if (numReadPorts > 1) io.exe_reqs(w).bits.rs2_data := exe_reg_rs2_data(w)
     if (numReadPorts > 2) io.exe_reqs(w).bits.rs3_data := exe_reg_rs3_data(w)
     if (enableSFBOpt)     io.exe_reqs(w).bits.pred_data := exe_reg_pred_data(w)
+    //chw: reg read, 更新io.exe_reqs(w).bits
+    io.exe_reqs(w).bits.flagdata := exe_reg_flag_data(w)   //flag_data
   }
 }

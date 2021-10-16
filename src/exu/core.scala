@@ -133,19 +133,36 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
                             Seq(true))) // The jmp unit is always bypassable
   pregfile.io := DontCare // Only use the IO if enableSFBOpt
 
+  //chw：增加标志寄存器的物理寄存器堆
+  val numFlagRFWritePorts     = exe_units.numIrfWritePorts
+  val numFlagRFReadPorts      = exe_units.numIrfReaders
+  //bypassableArray的数量应该==numWritePorts, 
+  //每个执行单元都有一个写端口，但是memunit不会改flag，所以没有mem的写端口
+  //numFlagRFReadPorts = exe_units.numIrfReaders, 主要是和定点的功能单元相对应，（之后可能要考虑浮点指令读标志寄存器的问题）
+  //numFlagRFWritePorts
+  //unicore中浮点使用的是另外一条标志寄存器，因此互不干扰
+  val flag_regfile         = Module(new RegisterFileSynthesizable(
+                            numFlagPhyRegs,
+                            numFlagRFReadPorts,
+                            numFlagRFWritePorts,
+                            4,
+                            exe_units.bypassable_write_port_mask)) 
+
   // wb arbiter for the 0th ll writeback
   // TODO: should this be a multi-arb?
   val ll_wbarb         = Module(new Arbiter(new ExeUnitResp(xLen), 1 +
                                                                    (if (usingFPU) 1 else 0) +
                                                                    (if (usingRoCC) 1 else 0)))
+  
+  //chw: 读寄存器阶段，增加标志寄存器的需要的读端口数，同时将源寄存器的读端口数从2->3
   val iregister_read   = Module(new RegisterRead(
                            issue_units.map(_.issueWidth).sum,
                            exe_units.withFilter(_.readsIrf).map(_.supportedFuncUnits),
                            numIrfReadPorts,
-                           exe_units.withFilter(_.readsIrf).map(x => 2),
+                           exe_units.withFilter(_.readsIrf).map(x => 3),
                            exe_units.numTotalBypassPorts,
                            jmp_unit.numBypassStages,
-                           xLen))
+                           xLen, numFlagRFReadPorts))
   val rob              = Module(new Rob(
                            numIrfWritePorts + numFpWakeupPorts, // +memWidth for ll writebacks
                            numFpWakeupPorts))
@@ -1292,6 +1309,10 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   // Register Read <- Issue (rrd <- iss)
   iregister_read.io.rf_read_ports <> iregfile.io.read_ports
   iregister_read.io.prf_read_ports := DontCare
+
+  //chw: 连接标志寄存器堆的读端口
+  iregister_read.io.flag_rf_read_ports <> flag_regfile.io.read_ports
+
   if (enableSFBOpt) {
     iregister_read.io.prf_read_ports <> pregfile.io.read_ports
   }
@@ -1337,6 +1358,11 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   // Cause not valid for for CALL or BREAKPOINTs (CSRFile will override it).
   csr.io.cause     := RegNext(rob.io.com_xcpt.bits.cause)
   csr.io.ungated_clock := clock
+
+  //chw: debug printf
+  when(csr.io.exception){
+    printf("core find exception, cycle: %d, pc: 0x%x, cause: %d\n", debug_cycles.value, csr.io.pc, csr.io.cause)
+  }
 
   val tval_valid = csr.io.exception &&
     csr.io.cause.isOneOf(
@@ -1461,6 +1487,8 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     w_cnt += 1
   }
 
+  //chw: 标志寄存器的写端口计数器
+  var flag_w_cnt = 0
   for (i <- 0 until exe_units.length) {
     if (exe_units(i).writesIrf) {
       val wbresp = exe_units(i).io.iresp
@@ -1480,6 +1508,19 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
         iregfile.io.write_ports(w_cnt).bits.data := wbdata
       }
 
+      //chw: 连接标志寄存器堆的写端口
+      flag_regfile.io.write_ports(flag_w_cnt).valid     := wbresp.valid && wbresp.bits.uop.is_unicore && wbresp.bits.uop.wflag
+      flag_regfile.io.write_ports(flag_w_cnt).bits.addr := wbresp.bits.uop.pwflag
+      flag_regfile.io.write_ports(flag_w_cnt).bits.data := wbresp.bits.flagdata
+
+      flag_w_cnt += 1
+      w_cnt += 1
+
+      //chw: debug printf
+      when(wbresp.valid && wbresp.bits.uop.is_unicore){
+        printf("wbresp: pc 0x%x, 0x%x, wflag: %d, pwflag: %d, data: %d\n",  Sext(wbresp.bits.uop.debug_pc(vaddrBits-1,0), xLen), wbresp.bits.uop.inst, wbresp.bits.uop.wflag, wbresp.bits.uop.pwflag, wbresp.bits.flagdata)
+      }
+
       assert (!wbIsValid(RT_FLT), "[fppipeline] An FP writeback is being attempted to the Int Regfile.")
 
       assert (!(wbresp.valid &&
@@ -1490,11 +1531,11 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
       assert (!(wbresp.valid &&
         wbresp.bits.uop.rf_wen &&
         wbresp.bits.uop.dst_rtype =/= RT_FIX),
-        "[fppipeline] writeback being attempted to Int RF with dst != Int type exe_units("+i+").iresp")
-      w_cnt += 1
+        "[fppipeline] writeback being attempted to Int RF with dst != Int type exe_units("+i+").iresp")   
     }
   }
   require(w_cnt == iregfile.io.write_ports.length)
+  require(flag_w_cnt == flag_regfile.io.write_ports.length)
 
   if (enableSFBOpt) {
     pregfile.io.write_ports(0).valid     := jmp_unit.io.iresp.valid && jmp_unit.io.iresp.bits.uop.is_sfb_br
