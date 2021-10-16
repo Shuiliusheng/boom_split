@@ -94,6 +94,9 @@ class FuncUnitReq(val dataWidth: Int)(implicit p: Parameters) extends BoomBundle
   val rs3_data = UInt(dataWidth.W) // only used for FMA units
   val pred_data = Bool()
 
+  //chw: 在功能单元的输入信号中增加读取的flagdata信号，FuncUnitReq
+  val flagdata = UInt(4.W)
+
   val kill = Bool() // kill everything
 }
 
@@ -111,6 +114,9 @@ class FuncUnitResp(val dataWidth: Int)(implicit p: Parameters) extends BoomBundl
   val addr = UInt((vaddrBits+1).W) // only for maddr -> LSU
   val mxcpt = new ValidIO(UInt((freechips.rocketchip.rocket.Causes.all.max+2).W)) //only for maddr->LSU
   val sfence = Valid(new freechips.rocketchip.rocket.SFenceReq) // only for mcalc
+
+  //chw: 在功能单元的输出信号中增加flagdata信号，funcUnitResp
+  val flagdata = UInt(4.W)
 }
 
 /**
@@ -317,8 +323,68 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
                  Mux(uop.ctrl.op2_sel === OP2_NEXT, Mux(uop.is_rvc, 2.U, 4.U),
                                                     0.U))))
 
-  val alu = Module(new freechips.rocketchip.rocket.ALU())
+  ///////////////////////////////////////////////////////////////////////
+  //chw：ALU中的一些信号修改，主要为了获取源操作数
+   val op1_data_unicore = WireInit(0.U(64.W))
+  //opsel: OP_RS1, OP_RS2, OP_R0, OP_I5, OP_I9, OP_NP, OP_PC, OP_X 
+  switch (uop.op1_sel){
+    is (OP_RS1) { op1_data_unicore := io.req.bits.rs1_data }
+    is (OP_RS2) { op1_data_unicore := io.req.bits.rs2_data }
+    is (OP_R0)  { op1_data_unicore := 0.U }
+    is (OP_I5)  { op1_data_unicore := uop.inst(13,9) }
+    is (OP_I9)  { op1_data_unicore := uop.inst(8,0) }
+    is (OP_NP)  { op1_data_unicore := 4.U }
+    is (OP_PC)  { op1_data_unicore := 0.U }
+    is (OP_X)   { op1_data_unicore := 0.U }
+  }
+  
+  val op2_data_unicore = WireInit(0.U(64.W))
+  switch (uop.op2_sel){
+    is (OP_RS1) { op2_data_unicore := io.req.bits.rs1_data }
+    is (OP_RS2) { op2_data_unicore := io.req.bits.rs2_data }
+    is (OP_R0)  { op2_data_unicore := 0.U }
+    is (OP_I5)  { op2_data_unicore := uop.inst(13,9) }
+    is (OP_I9)  { op2_data_unicore := uop.inst(8,0) }
+    is (OP_NP)  { op2_data_unicore := 4.U }
+    is (OP_PC)  { op2_data_unicore := 0.U }
+    is (OP_X)   { op2_data_unicore := 0.U }
+  }
 
+  /*********************** unicore shift fuc ********************************/
+  val shift_data_valid = (op2_data_unicore.asUInt >> 5.U ) =/= 0.U   //大于32
+  val shift_bits = op2_data_unicore(4,0)
+  val op1_data_lg_left = Mux(shift_data_valid, 0.U(32.W), (op1_data_unicore.asUInt << shift_bits.asUInt))
+
+  val op1_data_lg_right = Mux(shift_data_valid || (uop.op2_sel === OP_I5 && (shift_bits === 0.U)),  0.U(32.W), 
+                              (op1_data_unicore.asUInt >> shift_bits.asUInt))
+
+  val op1_data_al_right = Mux(shift_data_valid || (uop.op2_sel === OP_I5 && (shift_bits === 0.U)), 
+                              (op1_data_unicore.asSInt >> 32.U).asUInt, 
+                              (op1_data_unicore.asSInt >> shift_bits.asUInt).asUInt)
+  //循环右移实现有些复杂，暂时没有考虑         
+  val op1_data_lp_right = Mux((uop.op2_sel === OP_I5 && (shift_bits === 0.U)),
+                              Cat(io.req.bits.flagdata(1,1), op1_data_unicore(31,1)),
+                              op1_data_unicore)
+
+  val shift_out_unicore = Mux(uop.shift === LG_LEFT, op1_data_lg_left, 
+                            Mux(uop.shift === LG_RIGHT, op1_data_lg_right, 
+                            Mux(uop.shift === AL_RIGHT, op1_data_al_right,
+                            Mux(uop.shift === LP_RIGHT, op1_data_lp_right, op1_data_unicore))))
+
+  /*********************** unicore add fuc, add, sub, addc********************************/
+  //chw: function unit, 增加unicore中add/sub的计算逻辑
+  val isSub =  uop.ctrl.op_fcn === FN_SUB
+  val carryData = Mux(uop.rflag, Mux(isSub, Fill(32, io.req.bits.flagdata(2,2)), Cat(0.U(31.W), io.req.bits.flagdata(2,2))), 0.U(32.W))
+  val in2_inv = Mux(isSub, ~(op2_data_unicore(31,0)), op2_data_unicore(31,0))
+  //扩展成32位，用于判断是否发生进位
+  val add_temp = Cat(0.U(1.W), op1_data_unicore(31,0)) +  Cat(0.U(1.W), in2_inv) + isSub.asUInt + Cat(0.U(1.W), carryData(31,0))
+  val add_carry = add_temp(32,32)
+  val alu_out_unicore = Mux(uop.uopc === uopSHIFT, shift_out_unicore, add_temp(31,0))
+
+  /////////////////////////////////////////////////////////////////////////////////////////////
+
+  //riscv alu, 没有产生进位信息的逻辑，所以，对于unicore的add/sub单独拎出来
+  val alu = Module(new freechips.rocketchip.rocket.ALU())
   alu.io.in1 := op1_data.asUInt
   alu.io.in2 := op2_data.asUInt
   alu.io.fn  := uop.ctrl.op_fcn
@@ -439,9 +505,25 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   val r_val  = RegInit(VecInit(Seq.fill(numStages) { false.B }))
   val r_data = Reg(Vec(numStages, UInt(xLen.W)))
   val r_pred = Reg(Vec(numStages, Bool()))
-  val alu_out = Mux(io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data,
+  val alu_out_riscv = Mux(io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data,
     Mux(io.req.bits.uop.ldst_is_rs1, io.req.bits.rs1_data, io.req.bits.rs2_data),
     Mux(io.req.bits.uop.uopc === uopMOV, io.req.bits.rs2_data, alu.io.out))
+
+  //chw: ALU的结果，判断是否为unicore模式
+  val alu_out = Mux(io.req.bits.uop.is_unicore, alu_out_unicore, alu_out_riscv)
+  //chw: 根据ALU结果，确定CNVZ四个标志位
+  val flag_v = (op1_data_unicore(31,31) === 1.U && op2_data_unicore(31,31) === 1.U && alu_out_unicore(31,31) === 0.U) ||
+               (op1_data_unicore(31,31) === 0.U && op2_data_unicore(31,31) === 0.U && alu_out_unicore(31,31) === 1.U)
+  val flag_c = Mux(uop.ctrl.op_fcn === FN_SUB || uop.ctrl.op_fcn === FN_ADD, 1.U, 0.U)  //for debug
+  //val flag_c = Mux(uop.ctrl.op_fcn === FN_SUB || uop.ctrl.op_fcn === FN_ADD, add_carry, 0.U)
+  val flag_z = alu_out_unicore === 0.U 
+  val flag_n = alu_out_unicore(31,31)
+
+  //r_flag用于多周期的情况下，存储中间数据
+  val r_flag = Reg(Vec(numStages, UInt(4.W)))
+  r_flag(0) := Mux(io.req.bits.uop.is_unicore && io.req.bits.uop.wflag, 
+                Cat(flag_v.asUInt, flag_c.asUInt, flag_z.asUInt, flag_n.asUInt), 0.U(4.W))
+
   r_val (0) := io.req.valid
   r_data(0) := Mux(io.req.bits.uop.is_sfb_br, pc_sel === PC_BRJMP, alu_out)
   r_pred(0) := io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data
@@ -449,18 +531,29 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     r_val(i)  := r_val(i-1)
     r_data(i) := r_data(i-1)
     r_pred(i) := r_pred(i-1)
+    //chw: r_flag
+    r_flag(i) := r_flag(i-1)
   }
   io.resp.bits.data := r_data(numStages-1)
   io.resp.bits.predicated := r_pred(numStages-1)
+  //chw: ALU在resp的信号中，增加flag的结果
+  io.resp.bits.flagdata := r_flag(numStages-1)
+
   // Bypass
   // for the ALU, we can bypass same cycle as compute
   require (numStages >= 1)
   require (numBypassStages >= 1)
   io.bypass(0).valid := io.req.valid
   io.bypass(0).bits.data := Mux(io.req.bits.uop.is_sfb_br, pc_sel === PC_BRJMP, alu_out)
+  //chw: ALU单元中, 在bypass信号中，增加flagdata的结果
+  io.bypass(0).bits.flagdata := Mux(io.req.bits.uop.is_unicore && io.req.bits.uop.wflag, 
+                Cat(flag_v.asUInt, flag_c.asUInt, flag_z.asUInt, flag_n.asUInt), 0.U(4.W))
+
   for (i <- 1 until numStages) {
     io.bypass(i).valid := r_val(i-1)
     io.bypass(i).bits.data := r_data(i-1)
+    //chw: ALU单元中,  在bypass信号中，增加flagdata的结果
+    io.bypass(i).bits.flagdata := r_flag(i-1)
   }
 
   // Exceptions

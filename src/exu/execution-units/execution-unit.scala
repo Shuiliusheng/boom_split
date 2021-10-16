@@ -41,6 +41,8 @@ class ExeUnitResp(val dataWidth: Int)(implicit p: Parameters) extends BoomBundle
   val data = Bits(dataWidth.W)
   val predicated = Bool() // Was this predicated off?
   val fflags = new ValidIO(new FFlagsResp) // write fflags to ROB // TODO: Do this better
+  //chw: 在执行单元的输出信号中，增加标志寄存器的结果
+  val flagdata = Bits(4.W)
 }
 
 /**
@@ -273,7 +275,10 @@ class ALUExeUnit(
     alu.io.req.bits.kill     := io.req.bits.kill
     alu.io.req.bits.rs1_data := io.req.bits.rs1_data
     alu.io.req.bits.rs2_data := io.req.bits.rs2_data
-    alu.io.req.bits.rs3_data := DontCare
+    //unicore模式下的rs3寄存器可能被用到
+    alu.io.req.bits.rs3_data := io.req.bits.rs3_data
+    //chw: 将读取到的标志寄存器数据传递到功能单元
+    alu.io.req.bits.flagdata := io.req.bits.flagdata   //chw
     alu.io.req.bits.pred_data := io.req.bits.pred_data
     alu.io.resp.ready := DontCare
     alu.io.brupdate := io.brupdate
@@ -320,6 +325,10 @@ class ALUExeUnit(
     imul.io.req.bits.uop      := io.req.bits.uop
     imul.io.req.bits.rs1_data := io.req.bits.rs1_data
     imul.io.req.bits.rs2_data := io.req.bits.rs2_data
+    //unicore模式下的rs3寄存器可能被用到
+    alu.io.req.bits.rs3_data := io.req.bits.rs3_data
+    //chw: 将读取到的标志寄存器数据传递到功能单元
+    alu.io.req.bits.flagdata := io.req.bits.flagdata   //chw
     imul.io.req.bits.kill     := io.req.bits.kill
     imul.io.brupdate := io.brupdate
     iresp_fu_units += imul
@@ -344,6 +353,8 @@ class ALUExeUnit(
     queue.io.enq.bits.fflags := ifpu.io.resp.bits.fflags
     queue.io.brupdate := io.brupdate
     queue.io.flush := io.req.bits.kill
+    //初始化flagdata的输入信号
+    queue.io.enq.bits.flagdata := 0.U
 
     io.ll_fresp <> queue.io.deq
     ifpu_busy := !(queue.io.empty)
@@ -360,6 +371,10 @@ class ALUExeUnit(
     div.io.req.bits.uop        := io.req.bits.uop
     div.io.req.bits.rs1_data   := io.req.bits.rs1_data
     div.io.req.bits.rs2_data   := io.req.bits.rs2_data
+    //unicore模式下的rs3寄存器可能被用到
+    alu.io.req.bits.rs3_data := io.req.bits.rs3_data
+    //chw: 将读取到的标志寄存器数据传递到功能单元
+    alu.io.req.bits.flagdata := io.req.bits.flagdata   //chw
     div.io.brupdate            := io.brupdate
     div.io.req.bits.kill       := io.req.bits.kill
 
@@ -404,6 +419,10 @@ class ALUExeUnit(
       (f.io.resp.valid, f.io.resp.bits.data)))
     io.iresp.bits.predicated := PriorityMux(iresp_fu_units.map(f =>
       (f.io.resp.valid, f.io.resp.bits.predicated)))
+
+    //chw: 设置执行单元的输出信号中的flagdata信号
+    io.iresp.bits.flagdata := PriorityMux(iresp_fu_units.map(f =>
+      (f.io.resp.valid, f.io.resp.bits.flagdata)))
 
     // pulled out for critical path reasons
     // TODO: Does this make sense as part of the iresp bundle?
@@ -481,6 +500,9 @@ class FPUExeUnit(
     fpu_resp_val             := fpu.io.resp.valid
     fpu_resp_fflags          := fpu.io.resp.bits.fflags
 
+    //chw: 将功能的输入信号中的flagdata传递给fpu
+    fpu.io.req.bits.flagdata := io.req.bits.flagdata   //chw
+
     fu_units += fpu
   }
 
@@ -500,6 +522,9 @@ class FPUExeUnit(
     fdivsqrt.io.req.bits.kill     := io.req.bits.kill
     fdivsqrt.io.fcsr_rm           := io.fcsr_rm
     fdivsqrt.io.brupdate          := io.brupdate
+
+    //chw: 将功能的输入信号中的flagdata传递给fdivsqrt
+    fdivsqrt.io.req.bits.flagdata := io.req.bits.flagdata //chw
 
     // share write port with the pipelined units
     fdivsqrt.io.resp.ready := !(fu_units.map(_.io.resp.valid).reduce(_|_)) // TODO PERF will get blocked by fpiu.
@@ -537,6 +562,9 @@ class FPUExeUnit(
     queue.io.brupdate          := io.brupdate
     queue.io.flush           := io.req.bits.kill
 
+    //chw: 初始化部分执行单元输入信号中的flagdata信号
+    queue.io.enq.bits.flagdata := 0.U
+
     assert (queue.io.enq.ready) // If this backs up, we've miscalculated the size of the queue.
 
     val fp_sdq = Module(new BranchKillableQueue(new ExeUnitResp(dataWidth),
@@ -548,6 +576,9 @@ class FPUExeUnit(
     fp_sdq.io.enq.bits.fflags := DontCare
     fp_sdq.io.brupdate         := io.brupdate
     fp_sdq.io.flush          := io.req.bits.kill
+
+    //chw: 初始化部分执行单元输入信号中的flagdata信号
+    fp_sdq.io.enq.bits.flagdata := 0.U  //chw
 
     assert(!(fp_sdq.io.enq.valid && !fp_sdq.io.enq.ready))
 
