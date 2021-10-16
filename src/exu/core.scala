@@ -1016,9 +1016,14 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   // Minor hack: ecall and breaks need to increment the FTQ deq ptr earlier than commit, since
   // they write their PC into the CSR the cycle before they commit.
   // Since these are also unique, increment the FTQ ptr when they are dispatched
-  when (RegNext(dis_fire.reduce(_||_) && dis_uops(PriorityEncoder(dis_fire)).is_sys_pc2epc)) {
+  // when (RegNext(dis_fire.reduce(_||_) && dis_uops(PriorityEncoder(dis_fire)).is_sys_pc2epc)) {
+  //   io.ifu.commit.valid := true.B
+  //   io.ifu.commit.bits  := RegNext(dis_uops(PriorityEncoder(dis_valids)).ftq_idx)
+  // }
+  //chw: not sure 
+  when (dis_fire.reduce(_||_) && dis_uops(PriorityEncoder(dis_fire)).is_sys_pc2epc) {
     io.ifu.commit.valid := true.B
-    io.ifu.commit.bits  := RegNext(dis_uops(PriorityEncoder(dis_valids)).ftq_idx)
+    io.ifu.commit.bits  := dis_uops(PriorityEncoder(dis_valids)).ftq_idx
   }
 
   for (w <- 0 until coreWidth) {
@@ -1029,6 +1034,13 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     } else {
       dis_uops(w).rob_idx := Cat(rob.io.rob_tail_idx >> log2Ceil(coreWidth).U,
                                w.U(log2Ceil(coreWidth).W))
+    }
+
+    //chw: 为每条微指令记录它所在组的首指令的rob索引
+    dis_uops(w).rob_inst_idx := rob.io.rob_newinst_idxs(w)
+    //chw： debug printf
+    when(dis_uops(w).is_unicore){
+      printf("dis inst: cycles: %d, w: %d, valid: %d, fire: %d, inst: 0x%x 0x%x, splitnum: %d, self_index: %d, uopc: %d, lrs1: %d, lrs2: %d, ldst: %d\n", debug_cycles.value, w.U, dis_valids(w), dis_fire(w), dis_uops(w).debug_pc, dis_uops(w).inst, dis_uops(w).split_num, dis_uops(w).self_index, dis_uops(w).uopc, dis_uops(w).lrs1, dis_uops(w).lrs2, dis_uops(w).ldst)
     }
   }
 
@@ -1645,6 +1657,10 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   rob.io.lsu_clr_bsy    := io.lsu.clr_bsy
   rob.io.lsu_clr_unsafe := io.lsu.clr_unsafe
   rob.io.lxcpt          <> io.lsu.lxcpt
+
+  //chw: 将LSU的IO中新加入的信号连接到ROB上
+  rob.io.lsu_clr_bsy_first_idx    := io.lsu.clr_bsy_first_idx
+  rob.io.lsu_clr_bsy_self_idx     := io.lsu.clr_bsy_self_idx
 
   assert (!(csr.io.singleStep), "[core] single-step is unsupported.")
 

@@ -75,6 +75,14 @@ class RobIo(
   // Port for unmarking loads/stores as speculation hazards..
   val lsu_clr_unsafe   = Input(Vec(memWidth, Valid(UInt(robAddrSz.W))))
 
+  //chw: 用于输出当前微指令对应的指令组内第一条微指令的rob索引
+  val rob_newinst_idxs = Output(Vec(coreWidth, UInt(robAddrSz.W)))
+
+  //chw：从LSU获取当前完成执行的存储微指令的信息
+  val lsu_clr_bsy_first_idx     = Input(Vec(memWidth + 1, UInt(robAddrSz.W)))
+  val lsu_clr_bsy_self_idx      = Input(Vec(memWidth + 1, UInt(microIdxSz.W)))
+
+
 
   // Track side-effects for debug purposes.
   // Also need to know when loads write back, whereas we don't need loads to unbusy.
@@ -148,6 +156,10 @@ class CommitExceptionSignals(implicit p: Parameters) extends BoomBundle
 // The ROB needs to tell the FTQ if there's a pipeline flush (and what type)
 // so the FTQ can drive the frontend with the correct redirected PC.
   val flush_typ  = FlushTypes()
+
+  //chw: 通知前端是否需要切换处理器状态，切换指令会引发flush+npc fetch的异常
+  val switch_on = Bool()
+  val switch_off = Bool()
 }
 
 /**
@@ -200,6 +212,19 @@ class DebugRobSignals(implicit p: Parameters) extends BoomBundle
   val xcpt_val = Bool()
   val xcpt_uop = new MicroOp()
   val xcpt_badvaddr = UInt(xLen.W)
+}
+
+
+class VecBool(val num: Int)(implicit p: Parameters) extends BoomBundle
+{
+  val bsy = Vec(num, Bool())
+}
+
+//chw：用于记录指令组的信息
+class BlockInstInfo()(implicit p: Parameters) extends BoomBundle
+{
+  val rob_bsy   = Vec(numRobRows, new VecBool(maxUopNum))
+  val rob_expt  = Vec(numRobRows, Bool())
 }
 
 /**
@@ -300,6 +325,47 @@ class Rob(
   rob_debug_inst_mem.write(rob_tail, rob_debug_inst_wdata, rob_debug_inst_wmask)
   val rob_debug_inst_rdata = rob_debug_inst_mem.read(rob_head, will_commit.reduce(_||_))
 
+  ////////////////////////////////////////////////////////////////////
+  //chw：调试信息，用于输出当前执行周期
+  val debug_cycles = freechips.rocketchip.util.WideCounter(32)
+
+  //chw: 增加blockinfo的硬件结构，用于记录微指令组信息
+  val blockinfo      = Reg(Vec(coreWidth, new BlockInstInfo()))
+  val rob_newinst     = RegInit(0.U(log2Ceil(numRobRows).W))
+  val rob_newinst_lsb = RegInit(0.U((1 max log2Ceil(coreWidth)).W))
+  val rob_newinst_idx = Wire(UInt(robAddrSz.W))
+  rob_newinst_idx := Cat(rob_newinst, rob_newinst_lsb)
+
+
+  //chw: 根据当前普通指令的唤醒端口，更新blockinfo中bsyVec的信息
+  for (i <- 0 until numWakeupPorts) {
+    val wb_resp = io.wb_resps(i)
+    val wb_uop = wb_resp.bits.uop
+    //chw: for change, 更新rob_bsy0状态
+    when (wb_resp.valid){
+      val lsb = GetBankIdx(wb_uop.rob_inst_idx)
+      val idx = GetRowIdx(wb_uop.rob_inst_idx)
+      blockinfo(lsb).rob_bsy(idx).bsy(wb_uop.self_index) := true.B
+    }
+  }
+
+  //chw: 根据存储指令完成的信息，更新bsyVec的信息
+  for(w <- 0 until (memWidth + 1)){
+    when(io.lsu_clr_bsy(w).valid){
+      val lsb = GetBankIdx(io.lsu_clr_bsy_first_idx(w))
+      val idx = GetRowIdx(io.lsu_clr_bsy_first_idx(w))
+      blockinfo(lsb).rob_bsy(idx).bsy(io.lsu_clr_bsy_self_idx(w)) := true.B
+    }
+  }
+
+  //chw：根据当前出现的异常信息，更新blockinfo中的excpt信号
+  when (io.lxcpt.valid) {
+    val lsb = GetBankIdx(io.lxcpt.bits.uop.rob_inst_idx)
+    val idx = GetRowIdx(io.lxcpt.bits.uop.rob_inst_idx)
+    blockinfo(lsb).rob_expt(idx) := true.B
+  }
+  /////////////////////////////////////////////////////////////////
+
   for (w <- 0 until coreWidth) {
     def MatchBank(bank_idx: UInt): Bool = (bank_idx === w.U)
 
@@ -332,6 +398,77 @@ class Rob(
 
       assert (rob_val(rob_tail) === false.B, "[rob] overwriting a valid entry.")
       assert ((io.enq_uops(w).rob_idx >> log2Ceil(coreWidth)) === rob_tail)
+
+      //chw: 微指令进入rob时，初始化blockinfo的信息，记录首指令的rob索引
+      if(w == 0){ //在第一个bank的情况
+        when(io.enq_uops(w).self_index === 0.U){
+          //更新每条指令最开头的指令rob索引
+          rob_temp_lsb := w.U
+          rob_newinst_idx := Cat(rob_tail, rob_temp_lsb)
+          io.rob_newinst_idxs(w) := Cat(rob_tail, rob_temp_lsb)
+
+          for(t <- 0 until maxUopNum){
+            when(t.U < io.enq_uops(w).split_num){
+              blockinfo(rob_temp_lsb).rob_bsy(rob_tail).bsy(t) := false.B
+            }
+            .otherwise{
+              blockinfo(rob_temp_lsb).rob_bsy(rob_tail).bsy(t) := true.B
+            }
+          }
+          //将指令块内的异常和busy均记录在第一条指令对应的位置
+          blockinfo(rob_temp_lsb).rob_expt(rob_tail) := io.enq_uops(w).exception
+          
+          //chw: debug printf
+          when(io.enq_uops(w).is_unicore){
+            val lsb = GetBankIdx(rob_newinst_idx)
+            val idx = GetRowIdx(rob_newinst_idx)
+            printf("cycles: %d, insert rob: w: %d, inst: 0x%x 0x%x, split_num: %d\n", debug_cycles.value, w.U, io.enq_uops(w).debug_pc, io.enq_uops(w).inst, io.enq_uops(w).split_num)
+          }
+        }
+        .otherwise{ //不是首指令
+          io.rob_newinst_idxs(w) := Cat(rob_newinst, rob_newinst_lsb)
+          when(io.enq_uops(w).exception){
+            blockinfo(w).rob_expt(rob_tail) := true.B
+          }
+        }
+      }
+      else{
+        when(io.enq_uops(w).self_index === 0.U){
+          rob_temp_lsb := w.U
+          rob_newinst_idx := Cat(rob_tail, rob_temp_lsb)
+          io.rob_newinst_idxs(w) := Cat(rob_tail, rob_temp_lsb)
+          //chw: for new commit, 初始化bsy向量
+          for(t <- 0 until maxUopNum){
+            when(t.U < io.enq_uops(w).split_num){
+              blockinfo(rob_temp_lsb).rob_bsy(rob_tail).bsy(t) := false.B
+            }
+            .otherwise{
+              blockinfo(rob_temp_lsb).rob_bsy(rob_tail).bsy(t) := true.B
+            }
+          }
+          blockinfo(rob_temp_lsb).rob_expt(rob_tail) := io.enq_uops(w).exception
+          //chw: debug printf
+          when(io.enq_uops(w).is_unicore){
+            val lsb = GetBankIdx(rob_newinst_idx)
+            val idx = GetRowIdx(rob_newinst_idx)
+            printf("insert rob: w: %d, pc: 0x%x, split_num: %d, self_index: %d, inst_idx: %d, bsy_self: %d, lsb: %d, idx: %d\n", w.U, io.enq_uops(w).debug_pc, io.enq_uops(w).split_num, io.enq_uops(w).self_index, io.rob_newinst_idxs(w), !(io.enq_uops(w).is_fence ||io.enq_uops(w).is_fencei), lsb, idx)
+          }
+        }
+        .elsewhen(!io.enq_valids(w-1)){ //first valid
+          io.rob_newinst_idxs(w) := Cat(rob_newinst, rob_newinst_lsb)
+          when(io.enq_uops(w).exception){
+            blockinfo(w).rob_expt(rob_tail) := true.B
+          }
+        }
+        .otherwise{
+          io.rob_newinst_idxs(w) := io.rob_newinst_idxs(w-1)
+          when(io.enq_uops(w).exception){
+            blockinfo(w).rob_expt(rob_tail) := true.B
+          }
+        }
+      }
+
+
     } .elsewhen (io.enq_valids.reduce(_|_) && !rob_val(rob_tail)) {
       rob_uop(rob_tail).debug_inst := BUBBLE // just for debug purposes
     }
@@ -395,14 +532,39 @@ class Rob(
           "An instruction marked as safe is causing an exception")
       }
     }
-    can_throw_exception(w) := rob_val(rob_head) && rob_exception(rob_head)
+    /////////////////////////////////////////////////////////////////////
+    //chw: 判断指令是否出现异常，判断指令是否能够提交
+    val inst_rob_idx = GetRowIdx(rob_uop(rob_head).rob_inst_idx)
+    val inst_rob_lsb = GetBankIdx(rob_uop(rob_head).rob_inst_idx)
+    
+    //如果不是分开的指令，则使用rob_exception正常的判断；
+    //否则判断首指令对应的rob_expt0
+    val rob_head_xpt = Mux((rob_uop(rob_head).split_num === 1.U), 
+              rob_exception(rob_head), 
+              blockinfo(inst_rob_lsb).rob_expt(inst_rob_idx))
+    can_throw_exception(w) := rob_val(rob_head) && rob_head_xpt
 
     //-----------------------------------------------
     // Commit or Rollback
+    // 需要判断首指令对应的rob_bsy0/1来查看是否全部都unbusy
+    val rob_head_unbsy = Mux((rob_uop(rob_head).split_num === 1.U) || (rob_uop(rob_head).self_index =/= 0.U), 
+                  !(rob_bsy(rob_head)), 
+                  blockinfo(inst_rob_lsb).rob_bsy(inst_rob_idx).bsy.reduce(_&&_))//for other corewidth
 
-    // Can this instruction commit? (the check for exceptions/rob_state happens later).
-    can_commit(w) := rob_val(rob_head) && !(rob_bsy(rob_head)) && !io.csr_stall
+    //第一条指令是否已经提交了,如果提交了结果为true
+    val inst_head_committed = Mux((rob_uop(rob_head).split_num === 1.U) || (rob_uop(rob_head).self_index === 0.U), 
+                  false.B, 
+                  !(blockinfo(inst_rob_lsb).rob_bsy(inst_rob_idx).bsy.reduce(_&&_)))//for other corewidth
 
+    //是否需要执行csr_stall，如果指令块部分已经提交了，则应该将剩余的提交完
+    val need_csr_stall = Mux(io.csr_stall, !inst_head_committed, false.B)
+    can_commit(w) := rob_val(rob_head) && rob_head_unbsy && !need_csr_stall
+
+    //chw: debug printf
+    when(rob_val(rob_head) && rob_uop(rob_head).is_unicore){
+      printf("cycles: %d, rob head info: w: %d, inst: 0x%x 0x%x, split_num: %d, self_index: %d, can_commit: %d\n", debug_cycles.value, w.U, rob_uop(rob_head).debug_pc, rob_uop(rob_head).inst, rob_uop(rob_head).split_num, rob_uop(rob_head).self_index, can_commit(w))
+
+    /////////////////////////////////////////////////////////////////////
 
     // use the same "com_uop" for both rollback AND commit
     // Perform Commit
@@ -433,6 +595,11 @@ class Rob(
     when (rbk_row) {
       rob_val(com_idx)       := false.B
       rob_exception(com_idx) := false.B
+      //chw: 在指令发生回滚时，删除blockinfo表项中的所有信息
+      for(t <- 0 until maxUopNum){
+        blockinfo(w).rob_bsy(com_idx).bsy(t) := false.B
+      }
+      blockinfo(w).rob_expt(com_idx) := false.B
     }
 
     if (enableCommitMapTable) {
@@ -455,6 +622,12 @@ class Rob(
       {
         rob_val(i) := false.B
         rob_uop(i.U).debug_inst := BUBBLE
+        //chw: 在指令由于转移预测错误而需要删除时，删除blockinfo表项中的所有信息
+        for(t <- 0 until maxUopNum){
+          blockinfo(w).rob_bsy(com_idx).bsy(t) := false.B
+        }
+        blockinfo(w).rob_expt(com_idx) := false.B
+
       } .elsewhen (rob_val(i)) {
         // clear speculation bit even on correct speculation
         rob_uop(i).br_mask := GetNewBrMask(io.brupdate, br_mask)
@@ -474,6 +647,10 @@ class Rob(
     // Commit
     when (will_commit(w)) {
       rob_val(rob_head) := false.B
+      //chw: 在指令确定可以提交之后，清空bysVec的信息
+      for(t <- 0 until maxUopNum){
+        blockinfo(w).rob_bsy(com_idx).bsy(t) := false.B
+      }
     }
 
     // -----------------------------------------------
@@ -537,8 +714,10 @@ class Rob(
   // Finally, don't throw an exception if there are instructions in front of
   // it that want to commit (only throw exception when head of the bundle).
 
+  //如果前两个周期出现了异常，则暂时就不应该继续提交了
   var block_commit = (rob_state =/= s_normal) && (rob_state =/= s_wait_till_empty) || RegNext(exception_thrown) || RegNext(RegNext(exception_thrown))
   var will_throw_exception = false.B
+  //异常抛出要求指令是所有rob表项中最老的指令，因此需要block_xcpt统计
   var block_xcpt   = false.B
 
   for (w <- 0 until coreWidth) {
@@ -568,7 +747,9 @@ class Rob(
   io.com_xcpt.bits.is_rvc    := com_xcpt_uop.is_rvc
   io.com_xcpt.bits.pc_lob    := com_xcpt_uop.pc_lob
 
-  val flush_commit_mask = Range(0,coreWidth).map{i => io.commit.valids(i) && io.commit.uops(i).flush_on_commit}
+  // val flush_commit_mask = Range(0,coreWidth).map{i => io.commit.valids(i) && io.commit.uops(i).flush_on_commit}
+  //chw：出现状态切换指令时，也需要刷新处理器状态
+  val flush_commit_mask = Range(0,coreWidth).map{i => io.commit.valids(i) && (io.commit.uops(i).flush_on_commit||io.commit.uops(i).switch||io.commit.uops(i).switch_off)}
   val flush_commit = flush_commit_mask.reduce(_|_)
   val flush_val = exception_thrown || flush_commit
 
@@ -587,6 +768,20 @@ class Rob(
                                                 exception_thrown && !is_mini_exception,
                                                 flush_commit && flush_uop.uopc === uopERET,
                                                 refetch_inst)
+
+  //chw：如果是状态切换指令，则更新输出信号中的switch信号
+  io.flush.bits.switch_on := flush_uop.switch
+  io.flush.bits.switch_off := flush_uop.switch_off 
+
+  //chw: debug printf
+  when(flush_uop.switch){
+    printf("rob flush add switch is find as flush: %d\n", io.flush.bits.flush_typ);
+  }
+
+  when(flush_uop.switch_off){
+    printf("rob flush add switch off is find as flush: %d\n", io.flush.bits.flush_typ);
+  }
+
 
 
   // -----------------------------------------------
@@ -637,6 +832,8 @@ class Rob(
         next_xcpt_uop           := new_xcpt_uop
         next_xcpt_uop.exc_cause := io.lxcpt.bits.cause
         r_xcpt_badvaddr         := io.lxcpt.bits.badvaddr
+        //chw：debug printf
+        printf("cycle: %d, set xcpt 1, pc: 0x%x, inst: 0x%x, vaddr: 0x%x\n", debug_cycles.value, next_xcpt_uop.debug_pc, next_xcpt_uop.inst, r_xcpt_badvaddr)
       }
     } .elsewhen (!r_xcpt_val && enq_xcpts.reduce(_|_)) {
       val idx = enq_xcpts.indexWhere{i: Bool => i}
@@ -645,6 +842,10 @@ class Rob(
       r_xcpt_val      := true.B
       next_xcpt_uop   := io.enq_uops(idx)
       r_xcpt_badvaddr := AlignPCToBoundary(io.xcpt_fetch_pc, icBlockBytes) | io.enq_uops(idx).pc_lob
+
+      //chw: debug printf
+      printf("cycle: %d, set xcpt 2, pc: 0x%x, inst: 0x%x, vaddr: 0x%x\n", debug_cycles.value, next_xcpt_uop.debug_pc, next_xcpt_uop.inst, r_xcpt_badvaddr)
+      printf("cycle: %d, set2 info: 0x%x, 0x%x, 0x%x\n", debug_cycles.value, io.xcpt_fetch_pc, AlignPCToBoundary(io.xcpt_fetch_pc, icBlockBytes), AlignPCToBoundary(io.xcpt_fetch_pc, icBlockBytes) | io.enq_uops(idx).pc_lob)
 
     }
   }
@@ -747,25 +948,43 @@ class Rob(
 
   val rob_enq = WireInit(false.B)
 
+  //chw: 在rob发生状态变化时，更新一些新增加的内部信号
   when (rob_state === s_rollback && (rob_tail =/= rob_head || maybe_full)) {
     // Rollback a row
     rob_tail     := WrapDec(rob_tail, numRobRows)
     rob_tail_lsb := (coreWidth-1).U
     rob_deq := true.B
-  } .elsewhen (rob_state === s_rollback && (rob_tail === rob_head) && !maybe_full) {
+
+    rob_newinst := WrapDec(rob_tail, numRobRows) //rob tail
+    rob_newinst_lsb := (coreWidth-1).U
+  } 
+  .elsewhen (rob_state === s_rollback && (rob_tail === rob_head) && !maybe_full) {
     // Rollback an entry
     rob_tail_lsb := rob_head_lsb
-  } .elsewhen (io.brupdate.b2.mispredict) {
+
+    rob_newinst_lsb := rob_head_lsb
+  } 
+  .elsewhen (io.brupdate.b2.mispredict) {
     rob_tail     := WrapInc(GetRowIdx(io.brupdate.b2.uop.rob_idx), numRobRows)
     rob_tail_lsb := 0.U
-  } .elsewhen (io.enq_valids.asUInt =/= 0.U && !io.enq_partial_stall) {
+
+    rob_newinst := WrapInc(GetRowIdx(io.brupdate.b2.uop.rob_idx), numRobRows)
+    rob_newinst_lsb := 0.U
+  } 
+  .elsewhen (io.enq_valids.asUInt =/= 0.U && !io.enq_partial_stall) {
     rob_tail     := WrapInc(rob_tail, numRobRows)
     rob_tail_lsb := 0.U
     rob_enq      := true.B
-  } .elsewhen (io.enq_valids.asUInt =/= 0.U && io.enq_partial_stall) {
-    rob_tail_lsb := PriorityEncoder(~MaskLower(io.enq_valids.asUInt))
-  }
 
+    rob_newinst := GetRowIdx(rob_newinst_idx)
+    rob_newinst_lsb := GetBankIdx(rob_newinst_idx)
+  } 
+  .elsewhen (io.enq_valids.asUInt =/= 0.U && io.enq_partial_stall) {
+    rob_tail_lsb := PriorityEncoder(~MaskLower(io.enq_valids.asUInt))
+
+    rob_newinst := GetRowIdx(rob_newinst_idx)
+    rob_newinst_lsb := GetBankIdx(rob_newinst_idx)
+  }
 
   if (enableCommitMapTable) {
     when (RegNext(exception_thrown)) {
