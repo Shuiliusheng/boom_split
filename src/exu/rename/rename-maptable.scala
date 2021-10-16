@@ -64,6 +64,9 @@ class RenameMapTable(
     // Signals for restoring state following misspeculation.
     val brupdate      = Input(new BrUpdateInfo)
     val rollback    = Input(Bool())
+
+    //chw: maptable io中增加is_unicore的信号
+    val is_unicore  = Input(Bool())
   })
 
   // The map table register array and its branch snapshots.
@@ -78,18 +81,26 @@ class RenameMapTable(
   val remap_ldsts_oh = io.remap_reqs map (req => UIntToOH(req.ldst) & Fill(numLregs, req.valid.asUInt))
 
   // Figure out the new mappings seen by each pipeline slot.
-  for (i <- 0 until numLregs) {
-    if (i == 0 && !float) {
-      for (j <- 0 until plWidth+1) {
-        remap_table(j)(i) := 0.U
-      }
-    } else {
-      val remapped_row = (remap_ldsts_oh.map(ldst => ldst(i)) zip remap_pdsts)
-        .scanLeft(map_table(i)) {case (pdst, (ldst, new_pdst)) => Mux(ldst, new_pdst, pdst)}
+  // for (i <- 0 until numLregs) {
+  //   if (i == 0 && !float) {
+  //     for (j <- 0 until plWidth+1) {
+  //       remap_table(j)(i) := 0.U
+  //     }
+  //   } else {
+  //     val remapped_row = (remap_ldsts_oh.map(ldst => ldst(i)) zip remap_pdsts)
+  //       .scanLeft(map_table(i)) {case (pdst, (ldst, new_pdst)) => Mux(ldst, new_pdst, pdst)}
 
-      for (j <- 0 until plWidth+1) {
-        remap_table(j)(i) := remapped_row(j)
-      }
+  //     for (j <- 0 until plWidth+1) {
+  //       remap_table(j)(i) := remapped_row(j)
+  //     }
+  //   }
+  // }
+   for (i <- 0 until numLregs) {
+    val remapped_row = (remap_ldsts_oh.map(ldst => ldst(i)) zip remap_pdsts)
+      .scanLeft(map_table(i)) {case (pdst, (ldst, new_pdst)) => Mux(ldst, new_pdst, pdst)}
+
+    for (j <- 0 until plWidth+1) {//在unicore的情况下，不强制为0
+      remap_table(j)(i) := Mux(i.U === 0.U && !float.B && !io.is_unicore, 0.U, remapped_row(j))
     }
   }
 
@@ -119,7 +130,8 @@ class RenameMapTable(
     io.map_resps(i).stale_pdst := (0 until i).foldLeft(map_table(io.map_reqs(i).ldst)) ((p,k) =>
       Mux(bypass.B && io.remap_reqs(k).valid && io.remap_reqs(k).ldst === io.map_reqs(i).ldst, io.remap_reqs(k).pdst, p))
 
-    if (!float) io.map_resps(i).prs3 := DontCare
+    // if (!float) io.map_resps(i).prs3 := DontCare
+    io.map_resps(i).prs3 := Mux(!float.B && !io.is_unicore, DontCare, prs3)
   }
 
   // Don't flag the creation of duplicate 'p0' mappings during rollback.
@@ -127,3 +139,117 @@ class RenameMapTable(
   io.remap_reqs map (req => (req.pdst, req.valid)) foreach {case (p,r) =>
     assert (!r || !map_table.contains(p) || p === 0.U && io.rollback, "[maptable] Trying to write a duplicate mapping.")}
 }
+
+
+//chw: flag rename 使用的maptable
+class MapReq_Flag() extends Bundle
+{
+  val rflag = UInt(1.W)
+  val wflag = UInt(1.W)   //0: is valid req, 1 is invalid req, 因为只有逻辑上一个flag寄存器
+}
+
+class MapResp_Flag(val pregSz: Int) extends Bundle
+{
+  val prflag = UInt(pregSz.W)
+  val stale_pflag = UInt(pregSz.W)
+}
+
+class RemapReq_Flag(val pregSz: Int) extends Bundle
+{
+  val wflag = UInt(1.W)
+  val pwflag = UInt(pregSz.W)
+  val valid = Bool()
+}
+
+class RenameMapTable_Flag(
+  val plWidth: Int,
+  val numPregs: Int,
+  val bypass: Boolean)
+  (implicit p: Parameters) extends BoomModule
+{
+  val pregSz = log2Ceil(numPregs)
+
+  val io = IO(new BoomBundle()(p) {
+    // Logical sources -> physical sources.
+    val map_reqs    = Input(Vec(plWidth, new MapReq_Flag()))
+    val map_resps   = Output(Vec(plWidth, new MapResp_Flag(pregSz)))
+
+    // Remapping an ldst to a newly allocated pdst?
+    val remap_reqs  = Input(Vec(plWidth, new RemapReq_Flag(pregSz)))
+
+    // Dispatching branches: need to take snapshots of table state.
+    val ren_br_tags = Input(Vec(plWidth, Valid(UInt(brTagSz.W))))
+
+    // Signals for restoring state following misspeculation.
+    val brupdate      = Input(new BrUpdateInfo)
+    val rollback    = Input(Bool())
+  })
+
+  
+  // The map table register array and its branch snapshots.
+  //val numLRegs = 1.U    
+  //val map_table = RegInit(VecInit(Seq.fill(numLregs){0.U(pregSz.W)}))
+  //val br_snapshots = Reg(Vec(maxBrCount, Vec(numLregs, UInt(pregSz.W))))
+  val map_table = RegInit(VecInit(Seq.fill(1){0.U(pregSz.W)}))    //初始被映射到0上
+  val br_snapshots = Reg(Vec(maxBrCount, Vec(1, UInt(pregSz.W))))
+
+  // The intermediate states of the map table following modification by each pipeline slot.
+  //val remap_table = Wire(Vec(plWidth+1, Vec(numLregs, UInt(pregSz.W))))
+  val remap_table = Wire(Vec(plWidth+1, Vec(1, UInt(pregSz.W))))
+
+  // Uops requesting changes to the map table.
+  val remap_pdsts = io.remap_reqs map (_.pwflag)
+  val remap_valids = io.remap_reqs map (_.valid)
+  //valids: ren2_alloc_reqs || rbk_valids
+
+  //用于记录每条指令重命名之后maptable的状态，用于之后的恢复
+  val remapped_row = (remap_valids zip remap_pdsts) .scanLeft(map_table(0)) 
+    {case (pdst, (valid, new_pdst)) => Mux(valid, new_pdst, pdst)}  //如果有效，就是新命名的
+
+  for (j <- 0 until plWidth+1) {
+    remap_table(j)(0) := remapped_row(j)
+  }
+
+  // Figure out the new mappings seen by each pipeline slot.
+  /*
+  val remap_ldsts_oh = io.remap_reqs map (req => UIntToOH(req.wflag) & Fill(numLregs, req.valid.asUInt))
+  for (i <- 0 until numLregs) {
+    val remapped_row = (remap_ldsts_oh.map(ldst => ldst(i)) zip remap_pdsts)
+      .scanLeft(map_table(i)) {case (pdst, (ldst, new_pdst)) => Mux(ldst, new_pdst, pdst)}
+
+    for (j <- 0 until plWidth+1) {
+      remap_table(j)(i) := remapped_row(j)
+    }
+  }*/
+
+
+  // Create snapshots of new mappings.
+  for (i <- 0 until plWidth) {
+    when (io.ren_br_tags(i).valid) {
+      br_snapshots(io.ren_br_tags(i).bits) := remap_table(i+1)
+    }
+  }
+
+  when (io.brupdate.b2.mispredict) {
+    // Restore the map table to a branch snapshot.
+    map_table := br_snapshots(io.brupdate.b2.uop.br_tag)
+  } .otherwise {
+    // Update mappings.
+    map_table := remap_table(plWidth)
+  }
+
+
+  // Read out mappings.
+  for (i <- 0 until plWidth) {
+    //避免出现map_table(1)的情况, 因此map_table只有一个表项
+    val prflag0 = (0 until i).foldLeft(map_table(0.U)) ((p,k) =>
+      Mux(bypass.B && io.remap_reqs(k).valid && io.remap_reqs(k).wflag === 0.U, io.remap_reqs(k).pwflag, p))
+
+    val stale_pflag0 = (0 until i).foldLeft(map_table(0.U)) ((p,k) =>
+      Mux(bypass.B && io.remap_reqs(k).valid && io.remap_reqs(k).wflag === 0.U, io.remap_reqs(k).pwflag, p))
+
+    io.map_resps(i).prflag := Mux(io.map_reqs(i).rflag === 0.U, prflag0, 0.U)
+    io.map_resps(i).stale_pflag := Mux(io.map_reqs(i).wflag === 0.U, stale_pflag0, 0.U)
+  }
+}
+
