@@ -286,6 +286,9 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val flush_icache = Output(Bool())
 
   val perf = Input(new FrontendPerfEvents)
+
+  //chw：frontend的io中增加is_unicore的信号
+  val is_unicore = Output(Bool())
 }
 
 /**
@@ -589,7 +592,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f3_prev_is_half = RegInit(false.B)
 
   require(fetchWidth >= 4) // Logic gets kind of annoying with fetchWidth = 2
-  def isRVC(inst: UInt) = (inst(1,0) =/= 3.U)
+  //chw：修改原本isRVC的判断，因为unicore情况下，不考虑压缩指令
+  //def isRVC(inst: UInt) = (inst(1,0) =/= 3.U)
+  def isRVC(inst: UInt) = (inst(1,0) =/= 3.U)&&(!io.cpu.is_unicore)
   var redirect_found = false.B
   var bank_prev_is_half = f3_prev_is_half
   var bank_prev_half    = f3_prev_half
@@ -614,8 +619,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       if (w == 0) {
         val inst0 = Cat(bank_data(15,0), f3_prev_half)
         val inst1 = bank_data(31,0)
-        val exp_inst0 = ExpandRVC(inst0)
-        val exp_inst1 = ExpandRVC(inst1)
+        //chw: frontend, 修改原本exp_inst0的更新，因为unicore不需要扩展
+        val exp_inst0 = Mux(io.cpu.is_unicore, inst0, ExpandRVC(inst0))
+        val exp_inst1 = Mux(io.cpu.is_unicore, inst1, ExpandRVC(inst1))
         val pc0 = (f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U - 2.U)
         val pc1 = (f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U)
 
@@ -626,6 +632,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         bpd_decoder1.io.inst := exp_inst1
         bpd_decoder1.io.pc   := pc1
 
+        //chw:frontend, update branch decode的译码接口中的is_unicore
+        bpd_decoder0.io.is_unicore   := io.cpu.is_unicore
+        bpd_decoder1.io.is_unicore   := io.cpu.is_unicore
+
         when (bank_prev_is_half) {
           bank_insts(w)                := inst0
           f3_fetch_bundle.insts(i)     := inst0
@@ -635,10 +645,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           f3_fetch_bundle.edge_inst(b) := true.B
           if (b > 0) {
             val inst0b     = Cat(bank_data(15,0), last_inst)
-            val exp_inst0b = ExpandRVC(inst0b)
+            //chw: frontend, 修改原本exp_inst0的更新，因为unicore不需要扩展
+            val exp_inst0b = Mux(io.cpu.is_unicore, inst0b, ExpandRVC(inst0b))
             val bpd_decoder0b = Module(new BranchDecode)
             bpd_decoder0b.io.inst := exp_inst0b
             bpd_decoder0b.io.pc   := pc0
+            bpd_decoder0b.io.is_unicore   := io.cpu.is_unicore
 
             when (f3_bank_mask(b-1)) {
               bank_insts(w)                := inst0b
@@ -658,12 +670,14 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         valid := true.B
       } else {
         val inst = Wire(UInt(32.W))
-        val exp_inst = ExpandRVC(inst)
+        //chw: frontend, 修改原本exp_inst0的更新，因为unicore不需要扩展
+        val exp_inst = Mux(io.cpu.is_unicore, inst, ExpandRVC(inst))
         val pc = f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U
         val bpd_decoder = Module(new BranchDecode)
         bpd_decoder.io.inst := exp_inst
         bpd_decoder.io.pc   := pc
-
+        bpd_decoder.io.is_unicore   := io.cpu.is_unicore
+        
         bank_insts(w)                := inst
         f3_fetch_bundle.insts(i)     := inst
         f3_fetch_bundle.exp_insts(i) := exp_inst
