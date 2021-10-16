@@ -70,7 +70,8 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
                          // No bypassing for any FP units, + memWidth for ll_wb
                          Seq.fill(exe_units.numFrfWritePorts + memWidth){ false }
                          ))
-  val fregister_read = Module(new RegisterRead(
+  // val fregister_read = Module(new RegisterRead(
+  val fregister_read = Module(new FpRegisterRead(
                          issue_unit.issueWidth,
                          exe_units.withFilter(_.readsFrf).map(_.supportedFuncUnits),
                          exe_units.numFrfReadPorts,
@@ -133,6 +134,10 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
     issue_wakeup.valid := writeback.valid
     issue_wakeup.bits.pdst  := writeback.bits.uop.pdst
     issue_wakeup.bits.poisoned := false.B
+
+    //chw: 浮点流水线中，update fp issue unit wakeup port infor: pwflag & flag_valid
+    issue_wakeup.bits.pwflag := writeback.bits.uop.pwflag
+    issue_wakeup.bits.flag_valid := writeback.bits.uop.wflag && writeback.bits.uop.is_unicore
   }
   issue_unit.io.pred_wakeup_port.valid := false.B
   issue_unit.io.pred_wakeup_port.bits := DontCare
