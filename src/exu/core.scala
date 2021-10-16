@@ -104,7 +104,12 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   val rename_stage     = Module(new RenameStage(coreWidth, numIntPhysRegs, numIntRenameWakeupPorts, false))
   val fp_rename_stage  = if (usingFPU) Module(new RenameStage(coreWidth, numFpPhysRegs, numFpWakeupPorts, true)) else null
   val pred_rename_stage = Module(new PredRenameStage(coreWidth, ftqSz, 1))
-  val rename_stages    = if (usingFPU) Seq(rename_stage, fp_rename_stage, pred_rename_stage) else Seq(rename_stage, pred_rename_stage)
+  
+  //chw: 增加标记寄存器的重命名阶段
+  val numFlagRenameWakeupPorts = exe_units.numIrfWritePorts + numFastWakeupPorts - numAlwaysBypassable
+  val flag_rename_stage     = Module(new FlagRenameStage(coreWidth, numFlagPhyRegs, numFlagRenameWakeupPorts))
+  
+  val rename_stages    = if (usingFPU) Seq(rename_stage, fp_rename_stage, pred_rename_stage, flag_rename_stage) else Seq(rename_stage, pred_rename_stage, flag_rename_stage)
 
   val mem_iss_unit     = Module(new IssueUnitCollapsing(memIssueParam, numIntIssueWakeupPorts))
   mem_iss_unit.suggestName("mem_issue_unit")
@@ -148,6 +153,9 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   val int_iss_wakeups  = Wire(Vec(numIntIssueWakeupPorts, Valid(new ExeUnitResp(xLen))))
   val int_ren_wakeups  = Wire(Vec(numIntRenameWakeupPorts, Valid(new ExeUnitResp(xLen))))
   val pred_wakeup  = Wire(Valid(new ExeUnitResp(1)))
+
+  //chw： flag寄存器在重命名阶段的唤醒端口，用于更新busytable
+  val flag_ren_wakeups = Wire(Vec(numFlagRenameWakeupPorts, Valid(new ExeUnitResp(4))))  //c, n, v, z
 
   require (exe_units.length == issue_units.map(_.issueWidth).sum)
 
@@ -869,6 +877,9 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     rename.io.com_uops := rob.io.commit.uops
     rename.io.rbk_valids := rob.io.commit.rbk_valids
     rename.io.rollback := rob.io.commit.rollback
+
+    //chw: 连接重命名阶段的is_unicore信号
+    rename.io.is_unicore := isUnicoreMode
   }
 
 
@@ -894,7 +905,6 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     dis_uops(w).prs1 := Mux(dis_uops(w).lrs1_rtype === RT_FLT, f_uop.prs1,
                         Mux(dis_uops(w).lrs1_rtype === RT_FIX, i_uop.prs1, dis_uops(w).lrs1))
     dis_uops(w).prs2 := Mux(dis_uops(w).lrs2_rtype === RT_FLT, f_uop.prs2, i_uop.prs2)
-    dis_uops(w).prs3 := f_uop.prs3
     dis_uops(w).ppred := p_uop.ppred
     dis_uops(w).pdst := Mux(dis_uops(w).dst_rtype  === RT_FLT, f_uop.pdst,
                         Mux(dis_uops(w).dst_rtype  === RT_FIX, i_uop.pdst,
@@ -905,10 +915,24 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
                              f_uop.prs1_busy && (dis_uops(w).lrs1_rtype === RT_FLT)
     dis_uops(w).prs2_busy := i_uop.prs2_busy && (dis_uops(w).lrs2_rtype === RT_FIX) ||
                              f_uop.prs2_busy && (dis_uops(w).lrs2_rtype === RT_FLT)
-    dis_uops(w).prs3_busy := f_uop.prs3_busy && dis_uops(w).frs3_en
     dis_uops(w).ppred_busy := p_uop.ppred_busy && dis_uops(w).is_sfb_shadow
 
-    ren_stalls(w) := rename_stage.io.ren_stalls(w) || f_stall || p_stall
+    val prs3 = Mux(dis_uops(w).lrs3_rtype === RT_FLT, f_uop.prs3, i_uop.prs3)
+    val prs3_busy = i_uop.prs3_busy && (dis_uops(w).lrs3_rtype === RT_FIX) ||
+                    f_uop.prs3_busy && dis_uops(w).frs3_en && (dis_uops(w).lrs3_rtype === RT_FLT)
+
+    dis_uops(w).prs3 := Mux(isUnicoreMode, prs3, f_uop.prs3)
+    dis_uops(w).prs3_busy := Mux(isUnicoreMode, prs3_busy, f_uop.prs3_busy && dis_uops(w).frs3_en)
+    
+    //chw：标志寄存器的重命名: 获取重命名结果 prs3, busy, flag
+    val flag_uop = flag_rename_stage.io.ren2_uops(w)    //new
+    val flag_stall = Mux(isUnicoreMode, flag_rename_stage.io.ren_stalls(w), false.B) //new
+    dis_uops(w).prflag := flag_uop.prflag
+    dis_uops(w).pwflag := flag_uop.pwflag
+    dis_uops(w).stale_pflag := flag_uop.stale_pflag
+    dis_uops(w).pflag_busy := flag_uop.pflag_busy
+    
+    ren_stalls(w) := rename_stage.io.ren_stalls(w) || f_stall || p_stall || flag_stall
   }
 
   //-------------------------------------------------------------
@@ -1031,6 +1055,8 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
 
   var iss_wu_idx = 1
   var ren_wu_idx = 1
+  //chw: flag寄存器重命名的唤醒逻辑
+  var ren_flag_wu_idx = 0
   // The 0th wakeup port goes to the ll_wbarb
   int_iss_wakeups(0).valid := ll_wbarb.io.out.fire() && ll_wbarb.io.out.bits.uop.dst_rtype === RT_FIX
   int_iss_wakeups(0).bits  := ll_wbarb.io.out.bits
@@ -1049,6 +1075,7 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   }
 
   // loop through each issue-port (exe_units are statically connected to an issue-port)
+  //chw: 连接重命名阶段的唤醒端口
   for (i <- 0 until exe_units.length) {
     if (exe_units(i).writesIrf) {
       val fast_wakeup = Wire(Valid(new ExeUnitResp(xLen)))
@@ -1060,25 +1087,57 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
       assert(!(resp.valid && resp.bits.uop.rf_wen && resp.bits.uop.dst_rtype =/= RT_FIX))
 
       // Fast Wakeup (uses just-issued uops that have known latencies)
-      fast_wakeup.bits.uop := iss_uops(i)
-      fast_wakeup.valid    := iss_valids(i) &&
+      //如果指令知道执行延迟，则可以使用fast，否则只能够等待指令写入寄存器数据时再wakeup
+      val fast_wakeup_valid_dst = iss_valids(i) &&
                               iss_uops(i).bypassable &&
                               iss_uops(i).dst_rtype === RT_FIX &&
                               iss_uops(i).ldst_val &&
                               !(io.lsu.ld_miss && (iss_uops(i).iw_p1_poisoned || iss_uops(i).iw_p2_poisoned))
 
-      // Slow Wakeup (uses write-port to register file)
-      slow_wakeup.bits.uop := resp.bits.uop
-      slow_wakeup.valid    := resp.valid &&
+      val slow_wakeup_valid_dst = resp.valid &&
                                 resp.bits.uop.rf_wen &&
                                 !resp.bits.uop.bypassable &&
                                 resp.bits.uop.dst_rtype === RT_FIX
+
+
+      //判断是否指令存在wflag信号
+      //chw rename wakeup port fast/slow_wakeup_valid_flag
+      val fast_wakeup_valid_flag = iss_valids(i) && iss_uops(i).is_unicore &&
+                              iss_uops(i).bypassable &&
+                              iss_uops(i).wflag &&
+                              !(io.lsu.ld_miss && (iss_uops(i).iw_p1_poisoned || iss_uops(i).iw_p2_poisoned))
+
+      val slow_wakeup_valid_flag = resp.valid && resp.bits.uop.is_unicore &&
+                              resp.bits.uop.wflag &&
+                              !resp.bits.uop.bypassable
+
+      //chw : wake for issue unit, combine dst & flag wakeup
+      //chw : 当处于unicore模式的时候，如果dst/flag有效，则对issue unit进行唤醒
+      fast_wakeup.valid  := Mux(isUnicoreMode, fast_wakeup_valid_dst || fast_wakeup_valid_flag, fast_wakeup_valid_dst)
+      fast_wakeup.bits.uop := iss_uops(i)
+      // Slow Wakeup (uses write-port to register file)
+      slow_wakeup.valid    := Mux(isUnicoreMode, slow_wakeup_valid_dst || slow_wakeup_valid_flag, slow_wakeup_valid_dst)
+      slow_wakeup.bits.uop := resp.bits.uop
+
+      ///chw flag rename stage wakeup
+      val fast_wakeup_flag = Wire(Valid(new ExeUnitResp(4)))
+      val slow_wakeup_flag = Wire(Valid(new ExeUnitResp(4)))
+      fast_wakeup_flag := DontCare
+      slow_wakeup_flag := DontCare
+      fast_wakeup_flag.bits.uop := iss_uops(i)
+      fast_wakeup_flag.valid    := fast_wakeup_valid_flag
+
+      slow_wakeup_flag.bits.uop := resp.bits.uop
+      slow_wakeup_flag.valid    := slow_wakeup_valid_flag
+          
 
       if (exe_units(i).bypassable) {
         int_iss_wakeups(iss_wu_idx) := fast_wakeup
         iss_wu_idx += 1
       }
-      if (!exe_units(i).alwaysBypassable) {
+      //在目前的设计中，每个exe_unit除了alu一定包含另一个单元，因此该项始终满足
+      //如果以后出现了exeunit只包含了一个alu，则alwaysBypassable也应该相应的改变，因为slow_wakeup在指令不能够bypass的情况下是必要的
+      if (!exe_units(i).alwaysBypassable) { 
         int_iss_wakeups(iss_wu_idx) := slow_wakeup
         iss_wu_idx += 1
       }
@@ -1086,15 +1145,22 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
       if (exe_units(i).bypassable) {
         int_ren_wakeups(ren_wu_idx) := fast_wakeup
         ren_wu_idx += 1
+        //chw flag rename stage wakeup signal
+        flag_ren_wakeups(ren_flag_wu_idx) := fast_wakeup_flag
+        ren_flag_wu_idx += 1
       }
       if (!exe_units(i).alwaysBypassable) {
         int_ren_wakeups(ren_wu_idx) := slow_wakeup
         ren_wu_idx += 1
+        ////chw flag rename stage wakeup signal
+        flag_ren_wakeups(ren_flag_wu_idx) := slow_wakeup_flag
+        ren_flag_wu_idx += 1
       }
     }
   }
   require (iss_wu_idx == numIntIssueWakeupPorts)
   require (ren_wu_idx == numIntRenameWakeupPorts)
+  require (ren_flag_wu_idx == numFlagRenameWakeupPorts)
   require (iss_wu_idx == ren_wu_idx)
 
   // jmp unit performs fast wakeup of the predicate bits
@@ -1107,6 +1173,8 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   pred_wakeup.bits.fflags := DontCare
   pred_wakeup.bits.data := DontCare
   pred_wakeup.bits.predicated := DontCare
+  //初始化端口信号，因为信号集合中包括了flagdata，因此需要初始化
+  pred_wakeup.bits.flagdata := DontCare
 
   // Perform load-hit speculative wakeup through a special port (performs a poison wake-up).
   issue_units map { iu =>
@@ -1140,6 +1208,11 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     pred_rename_stage.io.wakeups(0) := pred_wakeup
   } else {
     pred_rename_stage.io.wakeups := DontCare
+  }
+
+  //chw: 标志寄存器重命名阶段的唤醒端口连接
+  for ((renport, flagport) <- flag_rename_stage.io.wakeups zip flag_ren_wakeups) {
+    renport <> flagport
   }
 
   // If we issue loads back-to-back endlessly (probably because we are executing some tight loop)
