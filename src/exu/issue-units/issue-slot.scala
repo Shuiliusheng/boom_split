@@ -260,9 +260,9 @@ class IssueSlot(val numWakeupPorts: Int)(implicit p: Parameters)
   io.request_hp := io.request && high_priority
 
   when (state === s_valid_1) {
-    io.request := p1 && p2 && p3 && ppred && !io.kill
+    io.request := p1 && p2 && p3 && ppred && !io.kill && flag_ready
   } .elsewhen (state === s_valid_2) {
-    io.request := (p1 || p2) && ppred && !io.kill
+    io.request := (p1 || p2) && ppred && !io.kill && flag_ready
   } .otherwise {
     io.request := false.B
   }

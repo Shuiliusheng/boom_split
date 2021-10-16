@@ -69,10 +69,10 @@ class RenameBusyTable(
 
     io.busy_resps(i).prs1_busy := busy_table(io.ren_uops(i).prs1) || prs1_was_bypassed && bypass.B
     io.busy_resps(i).prs2_busy := busy_table(io.ren_uops(i).prs2) || prs2_was_bypassed && bypass.B
-    io.busy_resps(i).prs3_busy := busy_table(io.ren_uops(i).prs3) || prs3_was_bypassed && bypass.B
-    // if (!float) io.busy_resps(i).prs3_busy := false.B
+    val prs3_busy = busy_table(io.ren_uops(i).prs3) || prs3_was_bypassed && bypass.B
+
     //chw: busytable中更改prs3_busy信号的设置
-    io.busy_resps(i).prs3_busy := Mux(!float.B && !io.is_unicore, false.B, busy_table(io.ren_uops(i).prs3) || prs3_was_bypassed && bypass.B)
+    io.busy_resps(i).prs3_busy := Mux(!float.B && !io.is_unicore, false.B, prs3_busy)
   }
 
   io.debug.busytable := busy_table

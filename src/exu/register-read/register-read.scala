@@ -108,7 +108,7 @@ class RegisterRead(
   rrd_rs2_data := DontCare
   rrd_rs3_data := DontCare
   rrd_pred_data := DontCare
-
+  rrd_flag_data := DontCare
   io.prf_read_ports := DontCare
 
   var idx = 0 // index into flattened read_ports array

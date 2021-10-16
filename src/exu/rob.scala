@@ -334,6 +334,7 @@ class Rob(
   val rob_newinst     = RegInit(0.U(log2Ceil(numRobRows).W))
   val rob_newinst_lsb = RegInit(0.U((1 max log2Ceil(coreWidth)).W))
   val rob_newinst_idx = Wire(UInt(robAddrSz.W))
+  val rob_temp_lsb = WireInit(0.U((1 max log2Ceil(coreWidth)).W))
   rob_newinst_idx := Cat(rob_newinst, rob_newinst_lsb)
 
 
@@ -563,6 +564,7 @@ class Rob(
     //chw: debug printf
     when(rob_val(rob_head) && rob_uop(rob_head).is_unicore){
       printf("cycles: %d, rob head info: w: %d, inst: 0x%x 0x%x, split_num: %d, self_index: %d, can_commit: %d\n", debug_cycles.value, w.U, rob_uop(rob_head).debug_pc, rob_uop(rob_head).inst, rob_uop(rob_head).split_num, rob_uop(rob_head).self_index, can_commit(w))
+    }
 
     /////////////////////////////////////////////////////////////////////
 
