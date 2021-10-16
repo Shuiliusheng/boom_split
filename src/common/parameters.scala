@@ -35,6 +35,9 @@ case class BoomCoreParams(
   numStqEntries: Int = 16,
   numIntPhysRegisters: Int = 96,
   numFpPhysRegisters: Int = 64,
+  //chw：define the number of physical flag register:
+  numFlagPhyRegisters: Int = 16,
+
   maxBrCount: Int = 4,
   numFetchBufferEntries: Int = 16,
   enableAgePriorityIssue: Boolean = true,
@@ -150,6 +153,22 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   // fetchWidth provided by CoreParams class.
   // decodeWidth provided by CoreParams class.
 
+  //chw: define some parameters for store the microOps to transbuffer 
+  //普通译码器能够译码得到的最大微指令数
+  val tranWidth = 4
+  //rob支持的最大的微指令组内的微指令数量
+  val maxUopNum = 20
+  //用于确定split_num和self_index的位宽
+  val microIdxSz = log2Ceil(maxUopNum) + 1
+
+  //微指令进入tranBuuffer的速率
+  val tranBuff_enq_width = 4
+  //enqTranBuffer的表项数量
+  val enqTranBuff_entries = 32
+  //根据tranBuff_enq_width将enqTranBuffer进行分组，然后根据微指令数量，确定组数
+  //用于给出移位位数
+  val enqTranBuff_setidx_bits = log2Ceil(tranBuff_enq_width)
+
   // coreWidth is width of decode, width of integer rename, width of ROB, and commit width
   val coreWidth = decodeWidth
 
@@ -169,6 +188,9 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
 
   val numIntPhysRegs= boomParams.numIntPhysRegisters // size of the integer physical register file
   val numFpPhysRegs = boomParams.numFpPhysRegisters  // size of the floating point physical register file
+
+  //chw：unicore中numFlagPhyRegs，用于在boom中使用
+  val numFlagPhyRegs = boomParams.numFlagPhyRegisters
 
   //************************************
   // Functional Units
@@ -253,8 +275,20 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val numRobRows      = numRobEntries/coreWidth
   val robAddrSz       = log2Ceil(numRobRows) + log2Ceil(coreWidth)
   // the f-registers are mapped into the space above the x-registers
-  val logicalRegCount = if (usingFPU) 64 else 32
-  val lregSz          = log2Ceil(logicalRegCount)
+  // val logicalRegCount = if (usingFPU) 64 else 32
+  // val lregSz          = log2Ceil(logicalRegCount)
+
+  //chw: expand logical register space for temp register
+   val logicalRegCount = 32
+  val lregSz          = log2Ceil(logicalRegCount) + 1
+
+  //chw：flag register information
+  val flagpregSz      = log2Ceil(boomParams.numFlagPhyRegisters)
+  //chw: temp register information
+  // val tempLRegNum     = 4
+  // val tempLRegSz      = log2Ceil(tempLRegNum)
+  // val tempPregSz      = log2Ceil(boomParams.numTempPhyRegisters)
+
   val ipregSz         = log2Ceil(numIntPhysRegs)
   val fpregSz         = log2Ceil(numFpPhysRegs)
   val maxPregSz       = ipregSz max fpregSz

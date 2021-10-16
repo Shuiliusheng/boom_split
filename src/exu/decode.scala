@@ -17,7 +17,7 @@ import freechips.rocketchip.util.{uintToBitPat,UIntIsOneOf}
 import FUConstants._
 import boom.common._
 import boom.util._
-
+import boom.common.UnicoreInsts._
 // scalastyle:off
 /**
  * Abstract trait giving defaults and other relevant values to different Decode constants/
@@ -454,14 +454,134 @@ object RoCCDecode extends DecodeConstants
 class DecodeUnitIo(implicit p: Parameters) extends BoomBundle
 {
   val enq = new Bundle { val uop = Input(new MicroOp()) }
-  val deq = new Bundle { val uop = Output(new MicroOp()) }
+  //chw: 指令译码，io信号，普通译码器，每周期最多输出4条微指令
+  val deq = new Bundle {  val uops = Output(Vec(4, new MicroOp()))
+                          val uop_valids = Output(Vec(4, Bool()))
+                          //num表示有效微指令条数
+                          val num = Output(UInt(5.W))
+                          //用于表示指令是否能够被该单元译码
+                          val is_decoded = Output(Bool()) 
+                          }
 
   // from CSRFile
   val status = Input(new freechips.rocketchip.rocket.MStatus())
   val csr_decode = Flipped(new freechips.rocketchip.rocket.CSRDecodeIO)
   val interrupt = Input(Bool())
   val interrupt_cause = Input(UInt(xLen.W))
+
+  //chw: 指令译码，io信号，用于判断当前采用哪一套译码逻辑
+  val is_unicore = Input(Bool())
 }
+
+//chw：译码Unicore指令的译码表
+abstract trait DecodeConstants_Unicore
+  extends freechips.rocketchip.rocket.constants.ScalarOpConstants
+  with freechips.rocketchip.rocket.constants.MemoryOpConstants
+{
+  val xpr64 = Y // TODO inform this from xLen
+  val DC2 = BitPat.dontCare(2) // Makes the listing below more readable
+  def decode_default: List[BitPat] =                                                       
+          //     is val inst?                          uses_ldq                         rd regtype                                          wakeup_delay
+          //     |  is fp inst?                        |  uses_stq                      |       rs1 regtype                                 |    bypassable
+          //     |  |  is single-prec?                 |  |    is_sys_pc2epc            |       |       rs2 regtype                         |    |    mem_cmd
+          //     |  |  |  micro-code                   |  |    |  flush_on_commit       |       |       |       rs3 regtype                 |    |    |    csr_cmd
+          //     |  |  |  |         iq-type  func unit |  |    |  |  inst_unique        |       |       |       |        frs3_en            |    |    |    |      mem size
+          //     |  |  |  |         |        |         |  |    |  |  |  is_br           |       |       |       |        |  wflag           |    |    |    |      |   shift way
+          //     |  |  |  |         |        |         |  |    |  |  |  |  is_fence     |       |       |       |        |  |  rflag        |    |    |    |      |   |    
+          //     |  |  |  |         |        |         |  |    |  |  |  |  |  is_fencei |       |       |       |        |  |  |  imm_sel   |    |    |    |      |   |    
+          //     |  |  |  |         |        |         |  |    |  |  |  |  |  |  is_amo |       |       |       |        |  |  |  |         |    |    |    |      |   |    
+          //     |  |  |  |         |        |         |  |    |  |  |  |  |  |  |      |       |       |       |        |  |  |  |         |    |    |    |      |   |
+            List(N, N, X, uopX    , IQT_INT, FU_X   ,  X, X,   X, X, X, X, X, X, X,     RT_X  , DC2    ,DC2    ,DC2    , X, X, X, IS_X,     DC2, X,   M_X, CSR.X, MX, NO_SHIFT, RD2_X)
+  val table: Array[(BitPat, List[BitPat])]
+}
+
+//chw：译码unicore指令得到的控制信号
+class CtrlSigs_Unicore extends Bundle
+{
+  val legal           = Bool()
+  val fp_val          = Bool()
+  val fp_single       = Bool()
+
+  val uopc            = UInt(UOPC_SZ.W)
+  val iq_type         = UInt(IQT_SZ.W)
+  val fu_code         = UInt(FUC_SZ.W)
+  val uses_ldq        = Bool()
+  val uses_stq        = Bool()
+
+  val is_br           = Bool()
+  val is_amo          = Bool()
+  val is_fence        = Bool()
+  val is_fencei       = Bool()
+  val is_sys_pc2epc   = Bool()
+  val inst_unique     = Bool()
+  val flush_on_commit = Bool()
+
+  val dst_type        = UInt(2.W)
+  val rs1_type        = UInt(2.W)
+  val rs2_type        = UInt(2.W)
+  val rs3_type        = UInt(2.W) //imm5/fixed reg/float reg
+
+  val frs3_en         = Bool()
+  val wflag           = Bool()
+  val rflag           = Bool()
+  val imm_sel         = UInt(IS_X.getWidth.W)
+
+  val wakeup_delay    = UInt(2.W)
+  val bypassable      = Bool()
+  
+  val mem_cmd         = UInt(freechips.rocketchip.rocket.M_SZ.W)
+  val csr_cmd         = UInt(freechips.rocketchip.rocket.CSR.SZ.W)
+
+  val mem_size        = UInt(2.W)
+  val shift           = UInt(3.W)
+  val rd2_src         = UInt(2.W)
+
+  def decode(inst: UInt, table: Iterable[(BitPat, List[BitPat])]) = {
+    val decoder = freechips.rocketchip.rocket.DecodeLogic(inst, UDecode.decode_default, table)
+    val sigs =
+      Seq(legal, fp_val, fp_single, uopc, iq_type, fu_code, uses_ldq, uses_stq, 
+          is_sys_pc2epc, flush_on_commit, inst_unique, is_br, is_fence, is_fencei, is_amo, 
+          dst_type, rs1_type, rs2_type, rs3_type, frs3_en, wflag, rflag, imm_sel,
+          wakeup_delay, bypassable,
+          mem_cmd, csr_cmd, mem_size, shift, rd2_src)
+      sigs zip decoder map {case(s,d) => s := d}
+      this
+  }
+}
+
+
+
+//chw：译码Unicore指令的译码表
+object UDecode extends DecodeConstants_Unicore
+{
+ //single-prec:单精
+  val table: Array[(BitPat, List[BitPat])] = Array(
+                //     is val inst?                        uses_ldq                      rd regtype                                       wakeup_delay
+                //     |  is fp inst?                      |  uses_stq                   |       rs1 regtype                              |    bypassable
+                //     |  |  is single-prec?               |  |  is_sys_pc2epc           |       |       rs2 regtype                      |    |    mem_cmd
+                //     |  |  |  micro-code                 |  |  |  flush_on_commit      |       |       |       rs3 regtype              |    |    |    csr_cmd
+                //     |  |  |  |        iq-type  func unit|  |  |  |  inst_unique       |       |       |       |        frs3_en         |    |    |    |      mem size
+                //     |  |  |  |        |        |        |  |  |  |  |  is_br          |       |       |       |        |  wflag        |    |    |    |      |   shift way
+                //     |  |  |  |        |        |        |  |  |  |  |  |  is_fence    |       |       |       |        |  |  rflag     |    |    |    |      |   |         Rd2 src
+                //     |  |  |  |        |        |        |  |  |  |  |  |  |  is_fencei|       |       |       |        |  |  |  imm_sel|    |    |    |      |   |         |
+                //     |  |  |  |        |        |        |  |  |  |  |  |  |  |  is_amo|       |       |       |        |  |  |  |      |    |    |    |      |   |         |
+                //     |  |  |  |        |        |        |  |  |  |  |  |  |  |  |     |       |       |       |        |  |  |  |      |    |    |    |      |   |         |       
+  ADD_L_IMM    -> List(Y, N, X, uopADD  ,IQT_INT, FU_ALU , N, N, N, N, N, N, N, N, N,    RT_FIX, RT_FIX ,RT_FIX ,RT_IMM5, N, N, N, IS_I,  1.U, Y,   M_X, CSR.N, MX, LG_LEFT , RD2_X  ),  
+  ADDA_R_IMM   -> List(Y, N, X, uopADD  ,IQT_INT, FU_ALU , N, N, N, N, N, N, N, N, N,    RT_FIX, RT_FIX ,RT_FIX ,RT_IMM5, N, Y, N, IS_I,  1.U, Y,   M_X, CSR.N, MX, LG_RIGHT, RD2_X  ),  
+  ADD_R_REG    -> List(Y, N, X, uopADD  ,IQT_INT, FU_ALU , N, N, N, N, N, N, N, N, N,    RT_FIX, RT_FIX ,RT_FIX ,RT_FIX , N, N, N, IS_I,  1.U, Y,   M_X, CSR.N, MX, LG_RIGHT, RD2_X  ),  
+  ADDA_LR_REG  -> List(Y, N, X, uopADD  ,IQT_INT, FU_ALU , N, N, N, N, N, N, N, N, N,    RT_FIX, RT_FIX ,RT_FIX ,RT_FIX , N, Y, N, IS_I,  1.U, Y,   M_X, CSR.N, MX, LP_RIGHT, RD2_X  ),  
+  ADDCA_L_IMM  -> List(Y, N, X, uopADD  ,IQT_INT, FU_ALU , N, N, N, N, N, N, N, N, N,    RT_FIX, RT_FIX ,RT_FIX ,RT_IMM5, N, Y, Y, IS_I,  1.U, Y,   M_X, CSR.N, MX, LG_LEFT , RD2_X  ),  
+  ADDCA_R_REG  -> List(Y, N, X, uopADD  ,IQT_INT, FU_ALU , N, N, N, N, N, N, N, N, N,    RT_FIX, RT_FIX ,RT_FIX ,RT_FIX , N, Y, Y, IS_I,  1.U, Y,   M_X, CSR.N, MX, LG_RIGHT, RD2_X  ),  
+  ADDIA_LR_IMM -> List(Y, N, X, uopADDI ,IQT_INT, FU_ALU , N, N, N, N, N, N, N, N, N,    RT_FIX, RT_FIX ,RT_X   ,RT_IMM5, N, Y, N, IS_I,  1.U, Y,   M_X, CSR.N, MX, LP_RIGHT, RD2_X  ), 
+  ADDICA_LR_IMM-> List(Y, N, X, uopADDI ,IQT_INT, FU_ALU , N, N, N, N, N, N, N, N, N,    RT_FIX, RT_FIX ,RT_X   ,RT_IMM5, N, Y, Y, IS_I,  1.U, Y,   M_X, CSR.N, MX, LP_RIGHT, RD2_X  ),
+  MULSL        -> List(Y, N, X, uopMUL  ,IQT_INT, FU_MUL , N, N, N, N, N, N, N, N, N,    RT_FIX, RT_FIX ,RT_FIX ,RT_X   , N, N, N, IS_I,  0.U, N,   M_X, CSR.N, MX, NO_SHIFT, RD2_RS3) 
+  )
+  //add.a: 修改标志位， wflag
+  //addc.a: 读标志位，并且修改标志位
+  //有读标志寄存器，必须要有读寄存器，因为要将不修改得结果回写？
+}
+
+
 
 /**
  * Decode unit that takes in a single instruction and generates a MicroOp.
@@ -472,6 +592,9 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   val io = IO(new DecodeUnitIo)
 
   val uop = Wire(new MicroOp())
+  val uop1 = Wire(new MicroOp())
+  val uop2 = Wire(new MicroOp())
+  val uop3 = Wire(new MicroOp())
   uop := io.enq.uop
 
   var decode_table = XDecode.table
@@ -481,28 +604,67 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   decode_table ++= (if (xLen == 64) X64Decode.table else X32Decode.table)
 
   val inst = uop.inst
-
   val cs = Wire(new CtrlSigs()).decode(inst, decode_table)
+
+  //chw: 创建unicore译码表，确定最终的译码结果
+  var decode_table_unicore = UDecode.table
+  val cs_u = Wire(new CtrlSigs_Unicore()).decode(inst, decode_table_unicore)
+
+  val unicoreMode = io.is_unicore && (!uop.switch_off)
+
+  val cs_fp_val = Mux(unicoreMode, cs_u.fp_val, cs.fp_val)
+  val cs_fp_single = Mux(unicoreMode, cs_u.fp_single, cs.fp_single)
+
+  val cs_uopc = Mux(unicoreMode, cs_u.uopc, cs.uopc)
+  val cs_iq_type = Mux(unicoreMode, cs_u.iq_type, cs.iq_type)
+  val cs_fu_code = Mux(unicoreMode, cs_u.fu_code, cs.fu_code)
+  val cs_uses_ldq = Mux(unicoreMode, cs_u.uses_ldq, cs.uses_ldq)
+  val cs_uses_stq = Mux(unicoreMode, cs_u.uses_stq, cs.uses_stq)
+
+  val cs_is_br = Mux(unicoreMode, cs_u.is_br, cs.is_br)
+  val cs_is_amo = Mux(unicoreMode, cs_u.is_amo, cs.is_amo)
+  val cs_is_fence = Mux(unicoreMode, cs_u.is_fence, cs.is_fence)
+  val cs_is_fencei = Mux(unicoreMode, cs_u.is_fencei, cs.is_fencei)
+  val cs_is_sys_pc2epc = Mux(unicoreMode, cs_u.is_sys_pc2epc, cs.is_sys_pc2epc)
+  val cs_inst_unique = Mux(unicoreMode, cs_u.inst_unique, cs.inst_unique)
+  val cs_flush_on_commit = Mux(unicoreMode, cs_u.flush_on_commit, cs.flush_on_commit)
+
+  val cs_dst_type = Mux(unicoreMode, cs_u.dst_type, cs.dst_type)
+  val cs_rs1_type = Mux(unicoreMode, cs_u.rs1_type, cs.rs1_type)
+  val cs_rs2_type = Mux(unicoreMode, cs_u.rs2_type, cs.rs2_type)
+  val cs_rs3_type = Mux(unicoreMode, cs_u.rs3_type, RT_X)
+
+  val cs_frs3_en = Mux(unicoreMode, cs_u.frs3_en, cs.frs3_en)
+  val cs_wflag = Mux(unicoreMode, cs_u.wflag, false.B)
+  val cs_rflag = Mux(unicoreMode, cs_u.rflag, false.B)
+  val cs_imm_sel = Mux(unicoreMode, cs_u.imm_sel, cs.imm_sel)
+  val cs_bypassable = Mux(unicoreMode, cs_u.bypassable, cs.bypassable)
+  val cs_csr_cmd = Mux(unicoreMode, cs_u.csr_cmd, cs.csr_cmd)
+  val cs_mem_cmd = Mux(unicoreMode, cs_u.mem_cmd, cs.mem_cmd)
+  val cs_rocc = Mux(unicoreMode, false.B, cs.rocc)
+
 
   // Exception Handling
   io.csr_decode.csr := inst(31,20)
-  val csr_en = cs.csr_cmd.isOneOf(CSR.S, CSR.C, CSR.W)
-  val csr_ren = cs.csr_cmd.isOneOf(CSR.S, CSR.C) && uop.lrs1 === 0.U
-  val system_insn = cs.csr_cmd === CSR.I
-  val sfence = cs.uopc === uopSFENCE
 
-  val cs_legal = cs.legal
-//   dontTouch(cs_legal)
+  //chw：译码一些微指令具有相同属性的信号
+  //同时兼顾了riscv原本指令的译码，riscv没有使用拆分的方案
+  val csr_en = cs_csr_cmd.isOneOf(CSR.S, CSR.C, CSR.W)
+  val csr_ren = cs_csr_cmd.isOneOf(CSR.S, CSR.C) && uop.lrs1 === 0.U
+  val system_insn = cs_csr_cmd === CSR.I
+  val sfence = cs_uopc === uopSFENCE
+  val cs_legal = Mux(unicoreMode, cs_u.legal, cs.legal)
 
-  val id_illegal_insn = !cs_legal ||
-    cs.fp_val && io.csr_decode.fp_illegal || // TODO check for illegal rm mode: (io.fpu.illegal_rm)
-    cs.rocc && io.csr_decode.rocc_illegal ||
-    cs.is_amo && !io.status.isa('a'-'a')  ||
-    (cs.fp_val && !cs.fp_single) && !io.status.isa('d'-'a') ||
+  val id_illegal_insn_riscv = !cs_legal ||
+    cs_fp_val && io.csr_decode.fp_illegal || // TODO check for illegal rm mode: (io.fpu.illegal_rm)
+    cs_rocc && io.csr_decode.rocc_illegal ||
+    cs_is_amo && !io.status.isa('a'-'a')  ||
+    (cs_fp_val && !cs_fp_single) && !io.status.isa('d'-'a') ||
     csr_en && (io.csr_decode.read_illegal || !csr_ren && io.csr_decode.write_illegal) ||
     ((sfence || system_insn) && io.csr_decode.system_illegal)
-
-//     cs.div && !csr.io.status.isa('m'-'a') || TODO check for illegal div instructions
+  val id_illegal_insn_unicore = !cs_legal
+  val id_illegal_insn = Mux(unicoreMode, id_illegal_insn_unicore, id_illegal_insn_riscv)
+  //check ok
 
   def checkExceptions(x: Seq[(Bool, UInt)]) =
     (x.map(_._1).reduce(_||_), PriorityMux(x))
@@ -519,80 +681,189 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   uop.exc_cause := xcpt_cause
 
   //-------------------------------------------------------------
+  //chw：译码特殊指令，状态切换 switch the cpu to unicore/riscv mode
+  uop.switch := (cs.uopc === uopADD) && (inst(RD_MSB,RD_LSB) === 0.U && inst(RS1_MSB,RS1_LSB) === 0.U && inst(RS2_MSB,RS2_LSB) === 1.U)
+  uop.switch_off := (cs.uopc === uopADD) && (inst(RD_MSB,RD_LSB) === 0.U && inst(RS1_MSB,RS1_LSB) === 0.U && inst(RS2_MSB,RS2_LSB) === 2.U)
+  uop.is_unique  := Mux(uop.switch||uop.switch_off, true.B, cs.inst_unique)
+  //chw: debug printf
+  when(uop.switch){
+    printf("decode uop switch is true:%x\n", inst)
+  }
 
-  uop.uopc       := cs.uopc
-  uop.iq_type    := cs.iq_type
-  uop.fu_code    := cs.fu_code
+  when(uop.switch_off){
+    printf("decode uop switch off is true: %x\n", inst)
+  }
+  val debug_cycles = freechips.rocketchip.util.WideCounter(32)
+  when(io.is_unicore){
+    //chw: debug printf
+    printf("cycles: %d, decode inst: 0x%x, 0x%x, lrs1: %d, lrs2: %d\n", debug_cycles.value, uop.debug_pc, inst, uop.lrs1, uop.lrs2)
+  }
 
-  // x-registers placed in 0-31, f-registers placed in 32-63.
-  // This allows us to straight-up compare register specifiers and not need to
-  // verify the rtypes (e.g., bypassing in rename).
-  uop.ldst       := inst(RD_MSB,RD_LSB)
-  uop.lrs1       := inst(RS1_MSB,RS1_LSB)
-  uop.lrs2       := inst(RS2_MSB,RS2_LSB)
-  uop.lrs3       := inst(RS3_MSB,RS3_LSB)
+  //-------------------------指令属性------------------------------------
+  uop.is_unicore      := io.is_unicore
+  uop.is_br           := cs_is_br
+  uop.is_jal          := (uop.uopc === uopJAL)
+  uop.is_jalr         := (uop.uopc === uopJALR)
+  uop.is_amo          := cs_is_amo
+  uop.is_fence        := cs_is_fence
+  uop.is_fencei       := cs_is_fencei
+  uop.is_sys_pc2epc   := cs_is_sys_pc2epc
+  uop.flush_on_commit := cs_flush_on_commit || (csr_en && !csr_ren && io.csr_decode.write_flush)
 
-  uop.ldst_val   := cs.dst_type =/= RT_X && !(uop.ldst === 0.U && uop.dst_rtype === RT_FIX)
-  uop.dst_rtype  := cs.dst_type
-  uop.lrs1_rtype := cs.rs1_type
-  uop.lrs2_rtype := cs.rs2_type
-  uop.frs3_en    := cs.frs3_en
+  //-------------------------指令信息------------------------------------
+  uop.uopc       := cs_uopc
+  uop.iq_type    := cs_iq_type
+  uop.fu_code    := cs_fu_code
+  uop.uses_ldq   := cs_uses_ldq
+  uop.uses_stq   := cs_uses_stq
+  uop.bypassable   := cs_bypassable
+  //shift
+  uop.shift := Mux(unicoreMode, cs_u.shift, NO_SHIFT)
 
-  uop.ldst_is_rs1 := uop.is_sfb_shadow
+  //--------------------------------------------------------------------------------
+
+  uop.ldst       := Mux(unicoreMode, inst(RD_MSB_UNICORE,RD_LSB_UNICORE),   inst(RD_MSB,RD_LSB))
+  uop.lrs1       := Mux(unicoreMode, inst(RS1_MSB_UNICORE,RS1_LSB_UNICORE), inst(RS1_MSB,RS1_LSB))
+  uop.lrs2       := Mux(unicoreMode, inst(RS2_MSB_UNICORE,RS2_LSB_UNICORE), inst(RS2_MSB,RS2_LSB))
+  uop.lrs3       := Mux(unicoreMode, inst(RS3_MSB_UNICORE,RS3_LSB_UNICORE), inst(RS3_MSB,RS3_LSB))
+  uop.wflag      := cs_wflag
+  uop.rflag      := cs_rflag
+
+  //--------------------------------------------------------------------------------
+
+  val ldst_val_riscv   = cs_dst_type =/= RT_X && !(inst(RD_MSB,RD_LSB) === 0.U && uop.dst_rtype === RT_FIX)
+  val ldst_val_unicore = cs_dst_type =/= RT_X && !(inst(RD_MSB_UNICORE,RD_LSB_UNICORE) === 31.U && uop.dst_rtype === RT_FIX)  //r31: pc
+  uop.ldst_val   := Mux(unicoreMode, ldst_val_unicore, ldst_val_riscv)
+  uop.dst_rtype  := cs_dst_type
+  uop.lrs1_rtype := cs_rs1_type
+  uop.lrs2_rtype := cs_rs2_type
+  uop.lrs3_rtype := cs_rs3_type
+  uop.frs3_en    := cs_frs3_en
+  uop.fp_val     := cs_fp_val
+  uop.fp_single  := cs_fp_single // TODO use this signal instead of the FPU decode's table signal?
+
+  //---------------------------------------------------------------------------------
+
+  uop.mem_cmd    := cs_mem_cmd
+  val mem_size_riscv = Mux(cs_mem_cmd.isOneOf(M_SFENCE, M_FLUSH_ALL), Cat(uop.lrs2 =/= 0.U, uop.lrs1 =/= 0.U), inst(13,12))
+  uop.mem_size   := Mux(unicoreMode, cs_u.mem_size, mem_size_riscv)
+  uop.mem_signed := Mux(unicoreMode, false.B, !inst(14))
+
+  //---------------------------------------------------------------------------------------
+  val di24_20 = Mux(cs_imm_sel === IS_B || cs_imm_sel === IS_S, inst(11,7), inst(24,20))
+  val imm_packed_riscv = Cat(inst(31,25), di24_20, inst(19,12))
+  
+  val imm_packed_unicore = inst(19,0)
+  uop.imm_8bits  := Cat(0.U(4.W), inst(23,20))
+  uop.imm_packed := Mux(unicoreMode, imm_packed_unicore, imm_packed_riscv)
+
+
+  //---------------------------------------------------------------------------------
+  uop.ldst_is_rs1 := !io.is_unicore && uop.is_sfb_shadow
   // SFB optimization
-  when (uop.is_sfb_shadow && cs.rs2_type === RT_X) {
+  when (!io.is_unicore && uop.is_sfb_shadow && cs_rs2_type === RT_X) {
     uop.lrs2_rtype  := RT_FIX
     uop.lrs2        := inst(RD_MSB,RD_LSB)
     uop.ldst_is_rs1 := false.B
-  } .elsewhen (uop.is_sfb_shadow && cs.uopc === uopADD && inst(RS1_MSB,RS1_LSB) === 0.U) {
+  } .elsewhen (!io.is_unicore && uop.is_sfb_shadow && cs_uopc === uopADD && inst(RS1_MSB,RS1_LSB) === 0.U) {
     uop.uopc        := uopMOV
     uop.lrs1        := inst(RD_MSB, RD_LSB)
     uop.ldst_is_rs1 := true.B
   }
-  when (uop.is_sfb_br) {
+  when (uop.is_sfb_br && !io.is_unicore) {
     uop.fu_code := FU_JMP
+  }  
+
+  //-------------------------------------------------------------
+  //chw: 创建四个译码表，分别用于译码四条微指令
+  var decode_table_subinst1 = SubDecode1.table
+  var decode_table_subinst2 = SubDecode2.table
+  var decode_table_subinst3 = SubDecode3.table
+  var decode_table_subinst4 = SubDecode4.table
+
+  val cs_sub0 = Wire(new CtrlSigs_SubInst()).decode(inst, decode_table_subinst1)
+  val cs_sub1 = Wire(new CtrlSigs_SubInst()).decode(inst, decode_table_subinst2)
+  val cs_sub2 = Wire(new CtrlSigs_SubInst()).decode(inst, decode_table_subinst3)
+  val cs_sub3 = Wire(new CtrlSigs_SubInst()).decode(inst, decode_table_subinst4)
+  
+  val subDecUnit0 = Module(new SubDecodeUnit)
+  val subDecUnit1 = Module(new SubDecodeUnit)
+  val subDecUnit2 = Module(new SubDecodeUnit)
+  val subDecUnit3 = Module(new SubDecodeUnit)
+
+  subDecUnit0.io.rawuop := uop
+  subDecUnit1.io.rawuop := uop1
+  subDecUnit2.io.rawuop := uop2
+  subDecUnit3.io.rawuop := uop3
+
+  subDecUnit0.io.cs_sub := cs_sub0
+  subDecUnit1.io.cs_sub := cs_sub1
+  subDecUnit2.io.cs_sub := cs_sub2
+  subDecUnit3.io.cs_sub := cs_sub3
+
+  uop1 := uop
+  uop2 := uop
+  uop3 := uop
+
+  when(unicoreMode && (uop.uopc === uopMUL)){
+    //chw: for new transform
+    io.deq.is_decoded := false.B
+  }
+  .otherwise{
+    io.deq.is_decoded := true.B
   }
 
+  //when(unicoreMode){
+  when(unicoreMode){
+    uop.split_num  := cs_sub0.split_num
+    uop1.split_num := cs_sub0.split_num
+    uop2.split_num := cs_sub0.split_num
+    uop3.split_num := cs_sub0.split_num
 
-  uop.fp_val     := cs.fp_val
-  uop.fp_single  := cs.fp_single // TODO use this signal instead of the FPU decode's table signal?
+    uop.is_unicore   := true.B
+    uop1.is_unicore  := true.B
+    uop2.is_unicore  := true.B
+    uop3.is_unicore  := true.B
 
-  uop.mem_cmd    := cs.mem_cmd
-  uop.mem_size   := Mux(cs.mem_cmd.isOneOf(M_SFENCE, M_FLUSH_ALL), Cat(uop.lrs2 =/= 0.U, uop.lrs1 =/= 0.U), inst(13,12))
-  uop.mem_signed := !inst(14)
-  uop.uses_ldq   := cs.uses_ldq
-  uop.uses_stq   := cs.uses_stq
-  uop.is_amo     := cs.is_amo
-  uop.is_fence   := cs.is_fence
-  uop.is_fencei  := cs.is_fencei
-  uop.is_sys_pc2epc   := cs.is_sys_pc2epc
-  uop.is_unique  := cs.inst_unique
-  uop.flush_on_commit := cs.flush_on_commit || (csr_en && !csr_ren && io.csr_decode.write_flush)
+    uop.self_index  := 0.U
+    uop1.self_index := 1.U
+    uop2.self_index := 2.U
+    uop3.self_index := 3.U
 
-  uop.bypassable   := cs.bypassable
+    io.deq.uop_valids(0) := cs_sub0.valid && io.deq.is_decoded
+    io.deq.uop_valids(1) := cs_sub1.valid && io.deq.is_decoded
+    io.deq.uop_valids(2) := cs_sub2.valid && io.deq.is_decoded
+    io.deq.uop_valids(3) := cs_sub3.valid && io.deq.is_decoded
 
-  //-------------------------------------------------------------
-  // immediates
+    io.deq.uops(0) := subDecUnit0.io.subuop
+    io.deq.uops(1) := subDecUnit1.io.subuop
+    io.deq.uops(2) := subDecUnit2.io.subuop
+    io.deq.uops(3) := subDecUnit3.io.subuop
 
-  // repackage the immediate, and then pass the fewest number of bits around
-  val di24_20 = Mux(cs.imm_sel === IS_B || cs.imm_sel === IS_S, inst(11,7), inst(24,20))
-  uop.imm_packed := Cat(inst(31,25), di24_20, inst(19,12))
+    //chw: debug printf
+    when(io.is_unicore){
+      printf("cycles: %d, decode inst: 0x%x, 0x%x, num: %d, valid: %d, %d, %d, %d\n", debug_cycles.value, uop.debug_pc, inst, uop.split_num, cs_sub0.valid, cs_sub1.valid, cs_sub2.valid, cs_sub3.valid)
+    }
 
-  //-------------------------------------------------------------
+    io.deq.num := Mux(io.deq.is_decoded, uop.split_num, 0.U)
+  }
+  .otherwise{
+    uop.split_num  := 1.U
+    uop.self_index := 0.U
 
-  uop.is_br          := cs.is_br
-  uop.is_jal         := (uop.uopc === uopJAL)
-  uop.is_jalr        := (uop.uopc === uopJALR)
-  // uop.is_jump        := cs.is_jal || (uop.uopc === uopJALR)
-  // uop.is_ret         := (uop.uopc === uopJALR) &&
-  //                       (uop.ldst === X0) &&
-  //                       (uop.lrs1 === RA)
-  // uop.is_call        := (uop.uopc === uopJALR || uop.uopc === uopJAL) &&
-  //                       (uop.ldst === RA)
+    io.deq.uop_valids(0) := true.B
+    io.deq.uop_valids(1) := false.B
+    io.deq.uop_valids(2) := false.B
+    io.deq.uop_valids(3) := false.B
 
-  //-------------------------------------------------------------
+    io.deq.uops(0) := uop
+    io.deq.uops(1) := uop
+    io.deq.uops(2) := uop
+    io.deq.uops(3) := uop
 
-  io.deq.uop := uop
+    io.deq.num := 1.U
+  }
+
 }
 
 /**
@@ -620,6 +891,8 @@ class BranchDecode(implicit p: Parameters) extends BoomModule
   val io = IO(new Bundle {
     val inst    = Input(UInt(32.W))
     val pc      = Input(UInt(vaddrBitsExtended.W))
+    val is_unicore = Input(Bool())
+    //chw: BranchDecode io add is_unicore signal
 
     val out = Output(new BranchDecodeSignals)
   })
@@ -680,31 +953,48 @@ class BranchDecode(implicit p: Parameters) extends BoomModule
                SRL         -> List(N, N, N, Y, Y)
             ))
 
-  val (cs_is_br: Bool) :: (cs_is_jal: Bool) :: (cs_is_jalr:Bool) :: (cs_is_shadowable:Bool) :: (cs_has_rs2) :: Nil = bpd_csignals
+  //chw: unicore指令的分支预译码逻辑，在获取到指令时开始工作，用于提前判断转移预测的正确性
+  val bpd_csignals_unicore =
+    freechips.rocketchip.rocket.DecodeLogic(io.inst,
+                  List[BitPat](N, N, N, N, N),
+                      ////         is br?        
+                      ////         |  is jal?   
+                      ////         |  |   is jalr?
+                      ////         |  |  |  is call?
+                      ////         |  |  |  |  is ret?
+                      ////         |  |  |  |  |
+            Array[(BitPat, List[BitPat])](
+               ADD_L_IMM   -> List(N, N, N, N, N),
+               ADDA_R_IMM  -> List(N, N, N, N, N) //可以不用指定
+    ))
+  
 
-  io.out.is_call := (cs_is_jal || cs_is_jalr) && GetRd(io.inst) === RA
-  io.out.is_ret  := cs_is_jalr && GetRs1(io.inst) === BitPat("b00?01") && GetRd(io.inst) === X0
+  val (cs_is_br_riscv: Bool) :: (cs_is_jal_riscv: Bool) :: (cs_is_jalr_riscv:Bool) :: (cs_is_shadowable:Bool) :: (cs_has_rs2) :: Nil = bpd_csignals
+  val (cs_is_br_unicore: Bool) :: (cs_is_jal_unicore: Bool) :: (cs_is_jalr_unicore:Bool) :: (cs_is_call:Bool) :: (cs_is_ret:Bool) :: Nil = bpd_csignals_unicore
+  val cs_is_br    = Mux(io.is_unicore, cs_is_br_unicore, cs_is_br_riscv)
+  val cs_is_jal   = Mux(io.is_unicore, cs_is_jal_unicore, cs_is_jal_riscv)
+  val cs_is_jalr  = Mux(io.is_unicore, cs_is_jalr_unicore, cs_is_jalr_riscv)
+  val is_call_riscv = (cs_is_jal || cs_is_jalr) && GetRd(io.inst) === RA
+  val is_ret_riscv = cs_is_jalr && GetRs1(io.inst) === BitPat("b00?01") && GetRd(io.inst) === X0
+  val target_riscv = Mux(cs_is_br, ComputeBranchTarget(io.pc, io.inst, xLen), ComputeJALTarget(io.pc, io.inst, xLen))
+  val target_unicore = ComputeBranchTarget_Unicore(io.pc, io.inst, xLen)
 
-  io.out.target := Mux(cs_is_br, ComputeBranchTarget(io.pc, io.inst, xLen),
-                                 ComputeJALTarget(io.pc, io.inst, xLen))
-  io.out.cfi_type :=
-    Mux(cs_is_jalr,
-      CFI_JALR,
-    Mux(cs_is_jal,
-      CFI_JAL,
-    Mux(cs_is_br,
-      CFI_BR,
-      CFI_X)))
+
+  io.out.is_call := Mux(io.is_unicore, cs_is_call, is_call_riscv) //cs_is_call/ret是unicore单独译码得到
+  io.out.is_ret  := Mux(io.is_unicore, cs_is_ret, is_ret_riscv)
+  io.out.target := Mux(io.is_unicore, target_unicore, target_riscv)
+  io.out.cfi_type := Mux(cs_is_jalr, CFI_JALR, Mux(cs_is_jal, CFI_JAL, Mux(cs_is_br, CFI_BR, CFI_X)))
 
   val br_offset = Cat(io.inst(7), io.inst(30,25), io.inst(11,8), 0.U(1.W))
-  // Is a sfb if it points forwards (offset is positive)
-  io.out.sfb_offset.valid := cs_is_br && !io.inst(31) && br_offset =/= 0.U && (br_offset >> log2Ceil(icBlockBytes)) === 0.U
+  val sfb_offset_valid_riscv = cs_is_br && !io.inst(31) && br_offset =/= 0.U && (br_offset >> log2Ceil(icBlockBytes)) === 0.U
+  val shadowable_riscv = cs_is_shadowable && ( 
+      !cs_has_rs2 || (GetRs1(io.inst) === GetRd(io.inst)) ||
+      (io.inst === ADD && GetRs1(io.inst) === X0))
+  
+  io.out.sfb_offset.valid := Mux(io.is_unicore, false.B, sfb_offset_valid_riscv)
   io.out.sfb_offset.bits  := br_offset
-  io.out.shadowable := cs_is_shadowable && (
-    !cs_has_rs2 ||
-    (GetRs1(io.inst) === GetRd(io.inst)) ||
-    (io.inst === ADD && GetRs1(io.inst) === X0)
-  )
+  io.out.shadowable := Mux(io.is_unicore, false.B, shadowable_riscv)
+  //check 2 Chipyard
 }
 
 /**

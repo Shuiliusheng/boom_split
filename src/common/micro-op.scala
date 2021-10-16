@@ -33,6 +33,44 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   with freechips.rocketchip.rocket.constants.MemoryOpConstants
   with freechips.rocketchip.rocket.constants.ScalarOpConstants
 {
+
+  //chw: for unicore instruction decode
+  //记录是否为swtich on/off指令，riscv <--> unicore
+  val switch           = Bool()
+  val switch_off       = Bool()
+
+  //是否为unicore的指令
+  val is_unicore       = Bool()     //是否为unicore指令
+
+  //指令是否需要移位和移位的方式
+  val shift            = UInt(3.W)
+
+  //增加对第三个源操作数类型的判断：RT_IMM5/RT_FIX/RT_FLT/RT_X
+  val lrs3_rtype       = UInt(2.W)    //RT_IMM5/RT_FIX/RT_FLT/RT_X
+
+  //标志寄存器的相关信号
+  val rflag            = Bool()     //需要读标志寄存器
+  val wflag            = Bool()     //需要写标志寄存器
+  val prflag           = UInt(flagpregSz.W) //读/写的物理flag号
+  val pwflag           = UInt(flagpregSz.W)
+  val pflag_busy       = Bool()     //chw：读取的物理flag寄存器是否busy
+  val stale_pflag      = UInt(flagpregSz.W) //chw：上一个分配的physical flag寄存器，用于最后回收使用
+
+  //用于拆分微指令时，每条微指令的两个源操作数的类型选择
+  val op1_sel         = UInt(3.W)
+  val op2_sel         = UInt(3.W)
+
+  //chw: 用于记录拆分的微指令的信息
+  val split_num       = UInt(microIdxSz.W)
+  val self_index      = UInt(microIdxSz.W)
+  val rob_inst_idx    = UInt(robAddrSz.W) //记录组内第一条微指令的ROB索引
+
+  //用于调试，记录每条指令的译码时的时钟周期，debug cycle
+  val cycles  = UInt(32.W)
+
+  //////////////////////////////////////////////////////////////////////////////////
+
+
   val uopc             = UInt(UOPC_SZ.W)       // micro-op code
   val inst             = UInt(32.W)
   val debug_inst       = UInt(32.W)
@@ -171,6 +209,11 @@ class CtrlSignals extends Bundle()
   val is_load     = Bool()   // will invoke TLB address lookup
   val is_sta      = Bool()   // will invoke TLB address lookup
   val is_std      = Bool()
+
+
+  //chw: for unicore microOp decode
+  //增加op3_sel，获取第三个源操作数的选择信号
+  val op3_sel = UInt(2.W)
 }
 
 

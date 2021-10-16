@@ -122,6 +122,58 @@ trait ScalarOpConstants
   val RT_X     = 2.U(2.W) // not-a-register (but shouldn't get a busy-bit, etc.)
                              // TODO rename RT_NAR
 
+
+  //chw: for unicore instruction decode
+  //unicore中第三个源寄存器rss/imm5选择，判断是imm还是rss
+  //和RT_FIX/FLT并列
+  val RT_IMM5  = 3.U(2.W)
+
+  //unicore访问的memory size
+  val MB      = 0.U(2.W)   //memory size = byte
+  val MH      = 1.U(2.W)   
+  val MW      = 2.U(2.W)   
+  val MX      = 3.U(2.W)  //invalid 
+
+  //转换之后，微指令中rd寄存器的类型
+  val RT_NO    = 0.U(3.W)
+  val RT_DST   = 1.U(3.W)
+  val RT_TMP   = 2.U(3.W)
+  val RT_RS1   = 3.U(3.W)
+  val RT_RS2   = 4.U(3.W)
+  val RT_RS3   = 5.U(3.W)
+  val RT_IMM   = 6.U(3.W)
+
+  //unicore指令移位方式
+  val LG_LEFT   = 7.U(3.W)  //
+  val LG_RIGHT  = 6.U(3.W)  //logical right shift
+  val LP_RIGHT  = 5.U(3.W)  //loop right shift
+  val AL_RIGHT  = 4.U(3.W)  //algorithm right shift
+  val NO_SHIFT  = 0.U(3.W)
+
+  //暂时不适用，用于支持两个目的寄存器的指令
+  val RD2_X       = 0.U(2.W)
+  val RD2_RS1     = 1.U(2.W)
+  val RD2_RS2     = 2.U(2.W)
+  val RD2_RS3     = 3.U(2.W)
+
+  //用于转换之后的微指令的源操作的选择
+  //opsel: OP_RS1, OP_RS2, OP_R0, OP_I5, OP_I9, OP_NP, OP_PC, OP_X 
+  val OP_X    = 0.U(3.W)
+  val OP_RS1  = 1.U(3.W)
+  val OP_RS2  = 2.U(3.W)
+  val OP_R0   = 3.U(3.W)
+  val OP_I5   = 4.U(3.W)
+  val OP_I9   = 5.U(3.W)
+  val OP_NP   = 6.U(3.W)
+  val OP_PC   = 7.U(3.W)
+
+  //新的uop类型，用于支持unicore的四种移位操作
+  val uopSHIFT     = 110.U(UOPC_SZ.W)
+
+  /////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
   // Micro-op opcodes
   // TODO change micro-op opcodes into using enum
   val UOPC_SZ = 7
@@ -294,6 +346,26 @@ trait ScalarOpConstants
  */
 trait RISCVConstants
 {
+
+  //chw: for unicore instruction decode
+  //unicore的各个寄存器的位置
+  val RD_MSB_UNICORE  = 18
+  val RD_LSB_UNICORE  = 14
+  val RS1_MSB_UNICORE = 23
+  val RS1_LSB_UNICORE = 19
+  val RS2_MSB_UNICORE = 4
+  val RS2_LSB_UNICORE = 0
+  val RS3_MSB_UNICORE = 13
+  val RS3_LSB_UNICORE = 9
+
+  //计算unicore中branch的目标地址， b/bcc #imm24: inst(23,0)
+  def ComputeBranchTarget_Unicore(pc: UInt, inst: UInt, xlen: Int)(implicit p: Parameters): UInt = {
+    val b_imm32 = Cat(Fill(6,inst(23)), inst(23,0), 0.U(2.W))
+    ((pc.asSInt + b_imm32.asSInt).asSInt & (-2).S).asUInt
+  }
+
+  ////////////////////////////////////////////////////////////////
+
   // abstract out instruction decode magic numbers
   val RD_MSB  = 11
   val RD_LSB  = 7

@@ -67,6 +67,10 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   //**********************************
   // construct all of the modules
 
+  //chw: for debug, debug_cycles用于显示当前的周期
+  val debug_cycles = freechips.rocketchip.util.WideCounter(32)
+
+
   // Only holds integer-registerfile execution units.
   val exe_units = new boom.exu.ExecutionUnits(fpu=false)
   val jmp_unit_idx = exe_units.jmp_unit_idx
@@ -483,6 +487,23 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   //-------------------------------------------------------------
   //-------------------------------------------------------------
 
+  //chw: 判断当前处理器处于Unicore或者risc-v的状态
+  val isUnicoreMode = RegInit(false.B)
+  when (RegNext(rob.io.flush.valid)) {
+    when (RegNext(rob.io.flush.bits.switch_on)){
+      isUnicoreMode := true.B
+      printf("cycle: %d, rob.io.flush switch on: %d\n", debug_cycles.value, isUnicoreMode)
+    }
+    when (RegNext(rob.io.flush.bits.switch_off)){
+      isUnicoreMode := false.B
+      printf("cycle: %d, rob.io.flush switch off: %d\n", debug_cycles.value, isUnicoreMode)
+    }
+  }
+
+  //chw：更新ifu的输入信号，用于在更改取指部分的逻辑
+  io.ifu.is_unicore := isUnicoreMode
+
+
   // track mask of finished instructions in the bundle
   // use this to mask out insts coming from FetchBuffer that have been finished
   // for example, back pressure may cause us to only issue some instructions from FetchBuffer
@@ -498,6 +519,46 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   //-------------------------------------------------------------
   // Decoders
 
+  //chw: 设置译码器的输入和输出，包括复杂译码器
+  val all_hazard = (brupdate.b1.mispredict_mask =/= 0.U) || brupdate.b2.mispredict || io.ifu.redirect_flush
+  //用于判断是否tranEnqBuffer能够进入新的微指令
+  val tran_enq_ready = Wire(Bool())
+  //用于判断当前有效的译码指令是否为复杂指令
+  val dec_cInsts = Wire(Vec(coreWidth, Bool()))
+  //记录当前有效的译码指令中哪些为尚未被复杂译码器译码的指令
+  val dec_cInsts_failed = Wire(Vec(coreWidth, Bool()))
+  //记录dec_cInst_failed的上一个有效状态
+  val last_dec_states = Reg(Vec(coreWidth, Bool()))
+
+  //计算当前周期复杂译码器应该译码哪一条复杂指令
+  val last_failed_dec_idx = PriorityEncoder(last_dec_states)
+  //用于表示当前复杂译码器译码了哪条指令
+  val compDU_idx = Wire(UInt(3.W))
+
+  //当出现了冒险或者是tran_enq_buffer不接受新指令时，不更新last_dec_states
+  when(!all_hazard && tran_enq_ready){
+    last_dec_states := dec_cInsts_failed
+  }
+
+  // 复杂指令译码器的信号连接 
+  val complex_decode_unit = Module(new CompDecodeUnit)
+  complex_decode_unit.io.status          := csr.io.status
+  complex_decode_unit.io.interrupt       := csr.io.interrupt
+  complex_decode_unit.io.interrupt_cause := csr.io.interrupt_cause
+  complex_decode_unit.io.is_unicore  := isUnicoreMode
+  complex_decode_unit.io.csr_decode  <> csr.io.decode(0)
+
+  //判断是否存在需要译码的复杂指令，如果是，则将译码器连接到该指令；否则默认为第一条指令
+  when(last_dec_states.reduce(_||_)){
+    complex_decode_unit.io.enq.uop := dec_fbundle.uops(compDU_idx).bits
+    compDU_idx := last_failed_dec_idx
+  }
+  .otherwise{
+    complex_decode_unit.io.enq.uop := dec_fbundle.uops(0).bits
+    compDU_idx := 0.U
+  }
+  ////////////////////////////////////////////////////////////////////////////////////
+
   for (w <- 0 until coreWidth) {
     dec_valids(w)                      := io.ifu.fetchpacket.valid && dec_fbundle.uops(w).valid &&
                                           !dec_finished_mask(w)
@@ -506,8 +567,12 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     decode_units(w).io.csr_decode      <> csr.io.decode(w)
     decode_units(w).io.interrupt       := csr.io.interrupt
     decode_units(w).io.interrupt_cause := csr.io.interrupt_cause
+    //chw：设置译码器的输入信号，is_unicore
+    decode_units(w).io.is_unicore  := isUnicoreMode
 
-    dec_uops(w) := decode_units(w).io.deq.uop
+    //输出信号，dec_uops是原本输出指令的集合，没有删除，仍旧有一些用处
+    dec_uops(w) := decode_units(w).io.deq.uops(0)
+    dec_uops(w).cycles := debug_cycles.value
   }
 
   //-------------------------------------------------------------
