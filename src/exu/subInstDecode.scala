@@ -88,7 +88,7 @@ class CtrlSigs_SubInst extends Bundle
     val sigs =
       Seq(valid, fp_val, fp_single, uopc, iq_type, fu_code, uses_ldq, uses_stq, is_br, 
           dst_type, rs1_type, rs2_type, rtemp1, rtemp2, wtemp, wflag, rflag, imm_sel,
-          wakeup_delay, bypassable, mem_cmd, mem_size, shift, split_num, bop1_sel, op2_sel)
+          wakeup_delay, bypassable, mem_cmd, mem_size, shift, split_num, op1_sel, op2_sel)
       sigs zip decoder map {case(s,d) => s := d}
       this
   }

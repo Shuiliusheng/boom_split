@@ -168,7 +168,7 @@ trait ScalarOpConstants
   val OP_PC   = 7.U(3.W)
 
   //新的uop类型，用于支持unicore的四种移位操作
-  val uopSHIFT     = 110.U(UOPC_SZ.W)
+  val uopSHIFT     = 110.U(7.W)
 
   /////////////////////////////////////////////////////////////////////////////////////////////////
 

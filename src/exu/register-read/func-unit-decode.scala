@@ -397,7 +397,7 @@ class RegisterReadDecode(supportedUnits: SupportedFuncUnits)(implicit p: Paramet
   io.rrd_uop.ctrl.imm_sel := Mux(io.rrd_uop.is_unicore, rrd_cs_unicore.imm_sel, rrd_cs_riscv.imm_sel)
   io.rrd_uop.ctrl.op_fcn  := Mux(io.rrd_uop.is_unicore, rrd_cs_unicore.op_fcn.asUInt, rrd_cs_riscv.op_fcn.asUInt)
   io.rrd_uop.ctrl.fcn_dw  := Mux(io.rrd_uop.is_unicore, rrd_cs_unicore.fcn_dw.asBool, rrd_cs_riscv.fcn_dw.asBool)
-  io.rrd_uop.ctrl.op3_sel := Mux(io.rrd_uop.is_unicore, io.rrd_uop.lrs3_rtype, OP3_NO)  //new
+  io.rrd_uop.ctrl.op3_sel := Mux(io.rrd_uop.is_unicore, io.rrd_uop.lrs3_rtype, 0.U)  //new
 
   //M_XLR不确定是什么存储操作
   when ( !io.rrd_uop.is_unicore && (io.rrd_uop.uopc === uopAMO_AG || (io.rrd_uop.uopc === uopLD && io.rrd_uop.mem_cmd === M_XLR))) {

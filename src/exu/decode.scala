@@ -754,7 +754,7 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   val imm_packed_riscv = Cat(inst(31,25), di24_20, inst(19,12))
   
   val imm_packed_unicore = inst(19,0)
-  uop.imm_8bits  := Cat(0.U(4.W), inst(23,20))
+  // uop.imm_8bits  := Cat(0.U(4.W), inst(23,20))
   uop.imm_packed := Mux(unicoreMode, imm_packed_unicore, imm_packed_riscv)
 
 
