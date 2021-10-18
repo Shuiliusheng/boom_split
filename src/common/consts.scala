@@ -171,9 +171,6 @@ trait ScalarOpConstants
   val uopSHIFT     = 110.U(7.W)
 
   /////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-
   // Micro-op opcodes
   // TODO change micro-op opcodes into using enum
   val UOPC_SZ = 7
